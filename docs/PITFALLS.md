@@ -382,3 +382,31 @@ grep -nE '\| *(tail|head|grep|sed|awk|wc|tr)[^|]*$' install-deb-v3.sh \
 
 这类 bug 的迷惑性在于：**每次报错位置都不一样**（上一个坑挡住了下一个），看似"修不完"。
 实际上全部来自同一条 `set -euo pipefail`。
+
+## 18. 面板域名访问 `/vnc.html` 是 404 —— noVNC 需要自己的 hostname
+
+装完打开 `https://<panel>/vnc.html` 得到面板的 404 页面，`https://<panel>/__stats` 也是 404。
+
+原因：MintPanel 监听 8090，websockify/noVNC 监听 6080，是**两个独立监听**，面板**不反代**
+noVNC 路径（面板里的 `/novnc` 是它自己那套容器桌面实现，跟 `opt/desktop/share/novnc` 无关）。
+tunnel 的 ingress 只写了一条 `hostname -> 127.0.0.1:8090`，6080 根本没有入口。
+
+所以桌面访问必须是第二个 hostname：
+
+```json
+{
+  "ingress": [
+    {"hostname": "nodaroo-02.10w123.com",     "service": "http://127.0.0.1:8090"},
+    {"hostname": "nodaroo-02-vnc.10w123.com", "service": "http://127.0.0.1:6080"},
+    {"service": "http_status:404"}
+  ]
+}
+```
+
+同时要建对应的 DNS CNAME（`<同样指向 <tunnel-id>.cfargotunnel.com`，proxied）。
+`CF_API_TOKEN` 模式现在会自动做这件事，第二条域名默认 `<sub>-vnc.<zone>`：
+
+- 覆盖：`CF_VNC_DOMAIN=vnc.example.com`
+- 关掉：`CF_NO_VNC=1`
+
+判定方法：`curl -s -o /dev/null -w '%{http_code}' https://<panel>/vnc.html` —— 404 就是只配了一条。

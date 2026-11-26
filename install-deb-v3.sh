@@ -55,6 +55,8 @@ mintpanel-desktop installer
   0) CF_API_TOKEN=<token> PANEL_DOMAIN=<host>
      全自动：脚本用细粒度 API token 建/复用 tunnel、写 ingress、建 DNS CNAME，
      然后把「每隧道 token」写进 supervisord。API token 只在安装时用一次，不落盘。
+     面板在 :8090、noVNC 在 :6080，是两个监听，所以会自动再建一条
+     <host 前缀>-vnc.<域> 指向 :6080（CF_VNC_DOMAIN 可覆盖，CF_NO_VNC=1 可关闭）。
      需要的权限：Account > Cloudflare Tunnel > Edit、Zone > DNS > Edit、
                  Zone > Zone > Read（给了 CF_ZONE_ID 可省）
   1) CF_TUNNEL_TOKEN=<token>
@@ -74,9 +76,15 @@ USAGE
 fi
 
 # 入口放在下载之前打印，避免装完才发现域名不对
+DESK_URL=""
 if [ -n "$CF_API_TOKEN" ] && [ -n "$PANEL_DOMAIN" ]; then
   ENTRY_MODE="named tunnel (CF_API_TOKEN, provisioned via API)"
   ENTRY_URL="https://$PANEL_DOMAIN"
+  if [ -n "${CF_NO_VNC:-}" ]; then
+    DESK_URL=""
+  else
+    DESK_URL="https://${CF_VNC_DOMAIN:-${PANEL_DOMAIN%%.*}-vnc.${PANEL_DOMAIN#*.}}/vnc.html"
+  fi
 elif [ -n "$CF_TUNNEL_TOKEN" ]; then
   ENTRY_MODE="named tunnel (CF_TUNNEL_TOKEN)"
   ENTRY_URL="https://${PANEL_DOMAIN:-<public hostname set in the Cloudflare dashboard>}"
@@ -95,6 +103,8 @@ echo " Source     : $BASE_URL"
 echo " Panel port : $PANEL_PORT"
 echo " Public URL : $ENTRY_URL"
 echo " Entry mode : $ENTRY_MODE"
+if [ -n "$DESK_URL" ]; then echo " Desktop    : $DESK_URL"; fi
+true
 echo "=================================================="
 
 if [ -z "$CF_TUNNEL_TOKEN" ] && [ -z "$CF_API_TOKEN" ] && [ ! -f "$TARGET/.cloudflared/config.yml" ]; then
@@ -851,12 +861,21 @@ CF_PROG="$OPT_SV/etc/conf.d/cloudflared.conf"
 # --- optional: provision the tunnel through the Cloudflare API -------------------------
 #     This is the fine-grained alternative to `cloudflared tunnel login`: no cert.pem and
 #     no account-wide credential ever lands on this host, only the per-tunnel token.
+# noVNC/websockify is a separate listener, so it needs its own hostname: the panel does
+# not proxy /vnc.html. Derive <sub>-vnc.<zone>, overridable by CF_VNC_DOMAIN, and
+# skippable with CF_NO_VNC=1.
+VNC_DOMAIN="${CF_VNC_DOMAIN:-}"
+if [ -z "$VNC_DOMAIN" ] && [ -n "$PANEL_DOMAIN" ] && [ -z "${CF_NO_VNC:-}" ]; then
+  VNC_DOMAIN="${PANEL_DOMAIN%%.*}-vnc.${PANEL_DOMAIN#*.}"
+fi
 if [ -n "$CF_API_TOKEN" ] && [ -n "$PANEL_DOMAIN" ]; then
   echo "  -> provisioning the tunnel through the Cloudflare API ($PANEL_DOMAIN)"
-  CF_OUT=$("$PY_BIN" - "$CF_API_TOKEN" "$PANEL_DOMAIN" "$PANEL_PORT" <<'PYCF'
+  CF_OUT=$("$PY_BIN" - "$CF_API_TOKEN" "$PANEL_DOMAIN" "$PANEL_PORT" "$VNC_DOMAIN" "$NOVNC_PORT" <<'PYCF'
 import json, os, sys, urllib.request, urllib.error
 
 token, domain, port = sys.argv[1], sys.argv[2], sys.argv[3]
+vnc_host = sys.argv[4] if len(sys.argv) > 4 else ""
+vnc_port = sys.argv[5] if len(sys.argv) > 5 else "6080"
 API = "https://api.cloudflare.com/client/v4"
 HDR = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
@@ -931,28 +950,36 @@ tok = r["result"] if isinstance(r.get("result"), str) else (r.get("result") or {
 if not tok:
     fail("tunnel token came back empty")
 
+# The panel lives on $port; noVNC/websockify lives on $vnc_port and needs its own hostname,
+# otherwise https://<panel>/vnc.html just 404s (the panel does not proxy it).
+ingress = [{"hostname": domain, "service": f"http://127.0.0.1:{port}"}]
+if vnc_host:
+    ingress.append({"hostname": vnc_host, "service": f"http://127.0.0.1:{vnc_port}"})
 r = call("PUT", f"/accounts/{acct}/cfd_tunnel/{tid}/configurations",
-         {"config": {"ingress": [{"hostname": domain, "service": f"http://127.0.0.1:{port}"},
-                                 {"service": "http_status:404"}]}})
+         {"config": {"ingress": ingress + [{"service": "http_status:404"}]}})
 if not r.get("success"):
     fail("cannot write the ingress config", r)
-print(f"NOTE=ingress {domain} -> http://127.0.0.1:{port}")
+for rule in ingress:
+    print(f"NOTE=ingress {rule['hostname']} -> {rule['service']}")
 
-r = call("GET", f"/zones/{zid}/dns_records?name={domain}")
-if not r.get("success"):
-    fail("cannot read DNS records (need Zone > DNS > Edit)", r)
-if r.get("result"):
-    print("NOTE=DNS record already present, left untouched")
-else:
-    r = call("POST", f"/zones/{zid}/dns_records",
-             {"type": "CNAME", "name": sub, "content": f"{tid}.cfargotunnel.com",
-              "proxied": True, "ttl": 1})
+for host in [h["hostname"] for h in ingress]:
+    r = call("GET", f"/zones/{zid}/dns_records?name={host}")
     if not r.get("success"):
-        fail("cannot create the DNS record", r)
-    print("NOTE=DNS CNAME created (proxied) -> cfargotunnel.com")
+        fail("cannot read DNS records (need Zone > DNS > Edit)", r)
+    if r.get("result"):
+        print(f"NOTE=DNS for {host} already present, left untouched")
+        continue
+    r = call("POST", f"/zones/{zid}/dns_records",
+             {"type": "CNAME", "name": host.split(".")[0],
+              "content": f"{tid}.cfargotunnel.com", "proxied": True, "ttl": 1})
+    if not r.get("success"):
+        fail(f"cannot create the DNS record for {host}", r)
+    print(f"NOTE=DNS CNAME created (proxied) for {host}")
 
 print(f"TUNNEL_ID={tid}")
 print(f"TUNNEL_TOKEN={tok}")
+if vnc_host:
+    print(f"VNC_URL=https://{vnc_host}")
 PYCF
 )
   CF_ERR=$(printf '%s\n' "$CF_OUT" | sed -n 's/^ERROR=//p')
@@ -971,7 +998,9 @@ PYCF
     echo "  !! the API returned no tunnel token"
     exit 1
   fi
+  CF_VNC_URL=$(printf '%s\n' "$CF_OUT" | sed -n 's/^VNC_URL=//p')
   echo "     tunnel ready (${CF_TUNNEL_ID}), token kept in the supervisord conf only"
+  if [ -n "$CF_VNC_URL" ]; then echo "     desktop (noVNC): $CF_VNC_URL/vnc.html"; fi
 fi
 
 # 三个分支共用的尾部
