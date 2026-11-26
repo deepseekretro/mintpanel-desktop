@@ -16,7 +16,6 @@ jobs:
       - name: sanity check the installer
         run: |
           bash -n install-deb-v3.sh
-          bash -n install-deb-v2.sh
           grep -q 'supervisord is the only supervisor' install-deb-v3.sh
 
       - name: verify the prebuilt binaries
@@ -32,7 +31,6 @@ jobs:
         with:
           files: |
             install-deb-v3.sh
-            install-deb-v2.sh
             dist/desktop-assets.tar.gz
             dist/cf-ui.mjs
             dist/fly-supervise.py

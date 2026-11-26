@@ -17,6 +17,12 @@ PANEL_PORT="${MINTPANEL_PORT:-8090}"
 VNC_PORT="${VNC_PORT:-5900}"
 NOVNC_PORT="${NOVNC_PORT:-6080}"
 DISPLAY_NUM="${DISPLAY_NUM:-99}"
+# Panel entry point. On an unfamiliar machine cloudflared has no authority of its
+# own over any domain -- the authorisation lives inside a tunnel token (or the
+# credentials JSON). Create the tunnel in the Cloudflare dashboard, set its public
+# hostname to http://127.0.0.1:$PANEL_PORT, then pass the token here.
+PANEL_DOMAIN="${PANEL_DOMAIN:-}"
+CF_TUNNEL_TOKEN="${CF_TUNNEL_TOKEN:-}"
 
 OPT_DIR="$TARGET/opt"
 OPT_NODE="$OPT_DIR/node"
@@ -30,11 +36,62 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  cat <<'USAGE'
+mintpanel-desktop installer
+
+  curl -fsSL <release-url>/install-deb-v3.sh | bash
+  curl -fsSL <release-url>/install-deb-v3.sh \
+    | CF_TUNNEL_TOKEN=<token> PANEL_DOMAIN=panel.example.com bash
+
+面板对外入口，三选一：
+  1) CF_TUNNEL_TOKEN=<token>
+     Cloudflare dashboard > Zero Trust > Networks > Tunnels 里创建 tunnel，
+     Public hostname 指向 http://127.0.0.1:8090，然后把 token 交给本脚本。
+     机器上不需要任何域名权限，授权全在那个 token 里。
+  2) 机器上已有 ~/.cloudflared/config.yml + credentials.json —— 直接复用。
+  3) 两者都没有 —— 走 quick tunnel，随机 *.trycloudflare.com 域名，重启就变。
+
+其他变量：
+  MINTPANEL_PORT=8090   MINTPANEL_DIR=$HOME   VNC_PORT=5900   NOVNC_PORT=6080
+  DISPLAY_NUM=99        BASE_URL=<release>    TOKEN=<private mirror token>
+USAGE
+  exit 0
+fi
+
+# 入口放在下载之前打印，避免装完才发现域名不对
+if [ -n "$CF_TUNNEL_TOKEN" ]; then
+  ENTRY_MODE="named tunnel (CF_TUNNEL_TOKEN)"
+  ENTRY_URL="https://${PANEL_DOMAIN:-<public hostname set in the Cloudflare dashboard>}"
+elif [ -f "$TARGET/.cloudflared/config.yml" ]; then
+  ENTRY_MODE="named tunnel (~/.cloudflared/config.yml)"
+  ENTRY_URL="https://${PANEL_DOMAIN:-<public hostname in config.yml>}"
+else
+  ENTRY_MODE="quick tunnel (random *.trycloudflare.com host)"
+  ENTRY_URL="(assigned at runtime, changes on every restart)"
+fi
+
 echo "=================================================="
 echo " MintPanel + Online .deb /opt Flattened Deployer"
-echo " Target : $OPT_DIR"
-echo " Source : $BASE_URL"
+echo " Target     : $OPT_DIR"
+echo " Source     : $BASE_URL"
+echo " Panel port : $PANEL_PORT"
+echo " Public URL : $ENTRY_URL"
+echo " Entry mode : $ENTRY_MODE"
 echo "=================================================="
+
+if [ -z "$CF_TUNNEL_TOKEN" ] && [ ! -f "$TARGET/.cloudflared/config.yml" ]; then
+  if [ -n "$PANEL_DOMAIN" ]; then
+    echo "[WARN] PANEL_DOMAIN=$PANEL_DOMAIN is ignored: this machine has no cloudflared"
+    echo "       credentials for it. A domain cannot be claimed from the machine side."
+  fi
+  echo " NOTE: quick tunnel gives a random *.trycloudflare.com host, not your domain."
+  echo "       For a stable domain: Cloudflare dashboard > Zero Trust > Networks >"
+  echo "       Tunnels > create > public hostname http://127.0.0.1:$PANEL_PORT, then"
+  echo "       re-run with  CF_TUNNEL_TOKEN=<token> PANEL_DOMAIN=<your host> bash ..."
+  echo "       (Ctrl-C now if that is what you want; continuing in 10 s.)"
+  sleep 10
+fi
 
 command -v curl >/dev/null || { echo "[ERR] curl is required"; exit 1; }
 
@@ -684,12 +741,10 @@ fi
 
 NAMED_CFG="$TARGET/.cloudflared/config.yml"
 CF_PROG="$OPT_SV/etc/conf.d/cloudflared.conf"
-if [ -f "$NAMED_CFG" ]; then
-  echo "  -> named tunnel config found, panel gets a fixed domain"
-  cat > "$CF_PROG" <<CFNAMED
-; Cloudflare named tunnel -> MintPanel. Managed by supervisord.
-[program:cloudflared]
-command=$OPT_CF/bin/cloudflared --no-autoupdate tunnel --config $NAMED_CFG run
+
+# 三个分支共用的尾部
+cf_tail() {
+  cat <<'CFTAIL'
 priority=45
 autostart=true
 autorestart=true
@@ -697,29 +752,52 @@ startsecs=5
 startretries=10
 stopsignal=TERM
 stopwaitsecs=10
-stdout_logfile=$OPT_PANEL/cf-named.log
 redirect_stderr=true
-CFNAMED
+CFTAIL
+}
+
+if [ -n "$CF_TUNNEL_TOKEN" ]; then
+  # A tunnel token carries the tunnel UUID + secret, so this machine needs no
+  # certificate, no `cloudflared login`, and no account authorisation of its own.
+  echo "  -> named tunnel via CF_TUNNEL_TOKEN"
+  mkdir -p "$OPT_PANEL"
+  umask 077
+  {
+    echo '; Cloudflare named tunnel via token -> MintPanel. Managed by supervisord.'
+    echo '; The token below is a credential: keep this file at mode 600.'
+    echo '[program:cloudflared]'
+    echo '; TUNNEL_TOKEN is passed as an environment variable, not on the command line,'
+    echo '; so the credential does not show up in ps output.'
+    echo "environment=TUNNEL_TOKEN=\"$CF_TUNNEL_TOKEN\""
+    echo "command=$OPT_CF/bin/cloudflared --no-autoupdate tunnel run"
+    echo "stdout_logfile=$OPT_PANEL/cf-named.log"
+    cf_tail
+  } > "$CF_PROG"
+  chmod 600 "$CF_PROG"
+  umask 022
+  CF_WAIT_LOG="$OPT_PANEL/cf-named.log"
+elif [ -f "$NAMED_CFG" ]; then
+  echo "  -> named tunnel config found, panel gets a fixed domain"
+  {
+    echo '; Cloudflare named tunnel -> MintPanel. Managed by supervisord.'
+    echo '[program:cloudflared]'
+    echo "command=$OPT_CF/bin/cloudflared --no-autoupdate tunnel --config $NAMED_CFG run"
+    echo "stdout_logfile=$OPT_PANEL/cf-named.log"
+    cf_tail
+  } > "$CF_PROG"
   CF_WAIT_LOG="$OPT_PANEL/cf-named.log"
 else
-  echo "  -> no named tunnel config, using a quick tunnel (random trycloudflare.com host)"
-  cat > "$CF_PROG" <<CFQUICK
-; Cloudflare quick tunnel -> MintPanel. Managed by supervisord.
-; For a stable domain: cloudflared tunnel create mintpanel \\
-;   && cloudflared tunnel route dns <name> <host> \\
-;   && write ~/.cloudflared/config.yml, then re-run this installer.
-[program:cloudflared]
-command=$OPT_CF/bin/cloudflared --no-autoupdate tunnel --url http://127.0.0.1:$PANEL_PORT
-priority=45
-autostart=true
-autorestart=true
-startsecs=5
-startretries=10
-stopsignal=TERM
-stopwaitsecs=10
-stdout_logfile=$OPT_PANEL/cf-panel.log
-redirect_stderr=true
-CFQUICK
+  echo "  -> no tunnel credentials, using a quick tunnel (random trycloudflare.com host)"
+  {
+    echo '; Cloudflare quick tunnel -> MintPanel. Managed by supervisord.'
+    echo '; For a stable domain: create a tunnel in the Cloudflare dashboard, point its'
+    echo '; public hostname at http://127.0.0.1:'"$PANEL_PORT"' , then re-run this installer'
+    echo '; with CF_TUNNEL_TOKEN=<token>.'
+    echo '[program:cloudflared]'
+    echo "command=$OPT_CF/bin/cloudflared --no-autoupdate tunnel --url http://127.0.0.1:$PANEL_PORT"
+    echo "stdout_logfile=$OPT_PANEL/cf-panel.log"
+    cf_tail
+  } > "$CF_PROG"
   CF_WAIT_LOG="$OPT_PANEL/cf-panel.log"
 fi
 

@@ -24,6 +24,8 @@ curl -fsSL https://github.com/deepseekretro/mintpanel-desktop/releases/latest/do
 | `INSTALL_BROWSER` | 1 | 是否装 Camoufox（0 = 跳过） |
 | `BASE_URL` | 本仓库 Release 附件 | 私有镜像时指向自己的 release 目录 |
 | `TOKEN` | 空 | 仅当 `BASE_URL` 需要鉴权时才设置 |
+| `CF_TUNNEL_TOKEN` | 空 | Cloudflare named tunnel 的 token；给了就用固定域名 |
+| `PANEL_DOMAIN` | 空 | 面板域名，仅用于打印提示（真正生效的是 Cloudflare 后台的 public hostname） |
 
 `websockify-go` 提供 `linux/amd64` 和 `linux/arm64` 预编译二进制（`dist/websockify-go-linux-*`），
 安装时按 `uname -m` 自动选择；拉不到时才退回源码编译，最后才是 Python websockify。
@@ -44,7 +46,7 @@ BASE_URL=https://mirror.example/releases TOKEN=xxxx \
 | 怎么进桌面 | 面板 `https://<域名>/` → noVNC → 端口 6080（**websockify-go**） |
 | 怎么开浏览器 | 桌面右键 →「Camoufox 159」，或按 **F1**（无桌面图标，刻意的） |
 | 挂了怎么办 | `supervisorctl status` 看状态；`healthcheck.sh` 每 30s 做服务级探测 |
-| 回滚 | `install-deb-v2.sh`（上一版）+ 安装时的 `.preinstall-backup-*` |
+| 回滚 | 安装时的 `.preinstall-backup-*` + `git checkout v1.1.1 -- install-deb-v3.sh` |
 
 ## 架构
 
