@@ -442,3 +442,14 @@ curl -s -i --http1.1 -H "Cookie: mintpanel_session=$SESS" \
 | 会被覆盖吗 | 会。重装 `novnc` deb 会覆盖；重跑安装脚本会重新打 |
 
 详细配方与真浏览器验证方法见 `/root/NOVNC-CLIPBOARD.md`。
+
+## 20. x11vnc 泄漏 SysV 共享内存 → 桌面黑屏（x11vnc FATAL）
+
+| 项 | 内容 |
+|---|---|
+| 症状 | 重装几次后 `x11vnc` 变 `FATAL`（supervisord 显示），`/novnc` 连不上；日志 `shmget(scanline) failed: No space left on device` |
+| 根因 | x11vnc 每次启动申请两个 SysV shm 段（7680 B + ≈8 MB），被 supervisord 重启时不释放。`kernel.shmmni` 默认 4096，累积到上限后无法再申请 |
+| 判断 | `ipcs -m \| grep -c '^0x'` 接近 4096；`diff` 里全是 `nattch=0` 的孤儿段 |
+| 修法 1 | `ipcs -m \| awk -v me=$(id -u) '$1 ~ /^0x/ && $3 == me && $6 == 0 {print $2}' \| while read id; do ipcrm -m $id; done`（`ipcrm -m` 一次只能删一个，`xargs -n 200 ipcrm -m` 是错的） |
+| 修法 2（根治） | x11vnc 加 **`-noshm`**，不再用 SysV 共享内存；安装脚本也会在启动前清理孤儿段 |
+| 注意 | `/dev/shm` 用量为 0 与 SysV shm 无关，别被 `df /dev/shm` 误导 |

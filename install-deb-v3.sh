@@ -535,6 +535,18 @@ echo "[5/7] Writing desktop configs & supervisord program set (supervisord is th
 mkdir -p "$TARGET/.vnc"
 chmod 700 "$TARGET/.vnc"
 rm -f "$TARGET/.vnc/passwd"
+
+# x11vnc leaks two SysV shared-memory segments per run and never frees them on restart.
+# After enough reinstalls SHMMNI (4096) is exhausted and x11vnc refuses to start with
+# "shmget(scanline) failed: No space left on device" -- the desktop silently goes dark.
+# Drop unattached segments owned by this uid; the -noshm flag in desktop.conf stops new ones.
+SHM_ORPHANS=$(ipcs -m 2>/dev/null | awk -v me="$(id -u)" '$1 ~ /^0x/ && $3 == me && $6 == 0' | wc -l || true)
+if [ "${SHM_ORPHANS:-0}" -gt 0 ]; then
+  echo "  -> clearing ${SHM_ORPHANS} orphaned SysV shm segments left by previous x11vnc runs"
+  ipcs -m 2>/dev/null | awk -v me="$(id -u)" '$1 ~ /^0x/ && $3 == me && $6 == 0 {print $2}' | while read -r id; do
+    ipcrm -m "$id" 2>/dev/null || true
+  done
+fi
 PY_BIN=""
 for cand in "$(command -v python3 2>/dev/null || true)" "$TARGET/python/bin/python3" "/usr/bin/python3"; do
   if [ -n "$cand" ] && [ -x "$cand" ]; then
