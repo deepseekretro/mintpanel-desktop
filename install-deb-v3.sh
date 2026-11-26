@@ -55,6 +55,7 @@ mintpanel-desktop installer
 其他变量：
   MINTPANEL_PORT=8090   MINTPANEL_DIR=$HOME   VNC_PORT=5900   NOVNC_PORT=6080
   DISPLAY_NUM=99        BASE_URL=<release>    TOKEN=<private mirror token>
+  MINTPANEL_TOKEN=<hex> 面板访问口令；不给则沿用上一次安装的，只有全新机器才随机生成
 USAGE
   exit 0
 fi
@@ -181,6 +182,11 @@ fi
 NODE_BIN="$OPT_NODE/bin/node"
 echo "  -> Node: $($NODE_BIN -v)"
 
+# Keep the existing panel token across reinstalls: it is the credential that external
+# things (server-list, bookmarks, /go/<idx> cookie bridge) hold. Regenerating it silently
+# breaks all of them with a 403.
+PANEL_TOKEN_PREV=""
+[ -s "$OPT_PANEL/.panel_token" ] && PANEL_TOKEN_PREV="$(cat "$OPT_PANEL/.panel_token" 2>/dev/null || true)"
 echo "[2/7] Downloading & installing MintPanel -> $OPT_PANEL ..."
   dl "$(rel_url mintpanel-bundle-x86_64.tar.gz)" "$STAGE/panel.tar.gz"
   tar -xzf "$STAGE/panel.tar.gz" -C "$OPT_PANEL"
@@ -210,10 +216,19 @@ chmod +x "$OPT_PANEL/start.sh"
 echo "  -> Seeding random Hysteria2 & Xray into encrypted SQLite vault..."
 (
   cd "$OPT_PANEL"
-  if [ ! -s "$OPT_PANEL/.panel_token" ]; then
+  if [ -n "${MINTPANEL_TOKEN:-}" ]; then
+    printf '%s' "$MINTPANEL_TOKEN" > "$OPT_PANEL/.panel_token"
+    echo "     panel token -> MINTPANEL_TOKEN (pinned by caller)"
+  elif [ -n "$PANEL_TOKEN_PREV" ] && [ ! -s "$OPT_PANEL/.panel_token" ]; then
+    printf '%s' "$PANEL_TOKEN_PREV" > "$OPT_PANEL/.panel_token"
+    echo "     panel token -> preserved from the previous install"
+  elif [ ! -s "$OPT_PANEL/.panel_token" ]; then
     "$NODE_BIN" -e 'console.log(require("node:crypto").randomBytes(16).toString("hex"))' > "$OPT_PANEL/.panel_token"
-    chmod 600 "$OPT_PANEL/.panel_token"
+    echo "     panel token -> newly generated"
+  else
+    echo "     panel token -> already present, kept"
   fi
+  chmod 600 "$OPT_PANEL/.panel_token"
   "$NODE_BIN" --experimental-sqlite --input-type=module <<'SEEDEOF'
 import crypto from "node:crypto";
 import fs from "node:fs";
