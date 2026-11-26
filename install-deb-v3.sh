@@ -67,7 +67,7 @@ mintpanel-desktop installer
 其他变量：
   MINTPANEL_PORT=8090   MINTPANEL_DIR=$HOME   VNC_PORT=5900   NOVNC_PORT=6080
   DISPLAY_NUM=99        BASE_URL=<release>    TOKEN=<private mirror token>
-  CF_ACCOUNT_ID / CF_ZONE_ID  可选，省掉两次查询
+  CF_ACCOUNT_ID / CF_ZONE_ID / CF_TUNNEL_NAME  可选，省掉两次查询 / 自定义隧道名
   MINTPANEL_TOKEN=<hex> 面板访问口令；不给则沿用上一次安装的，只有全新机器才随机生成
 USAGE
   exit 0
@@ -851,6 +851,7 @@ parts = domain.split(".")
 if len(parts) < 3:
     fail("PANEL_DOMAIN must look like sub.zone.tld")
 sub, zone_name = parts[0], ".".join(parts[1:])
+tname = os.environ.get("CF_TUNNEL_NAME", "").strip() or sub
 
 acct = os.environ.get("CF_ACCOUNT_ID", "").strip()
 if not acct:
@@ -866,18 +867,26 @@ if not zid:
         fail(f"cannot resolve zone {zone_name} (need Zone > Zone > Read, or set CF_ZONE_ID)", r)
     zid = r["result"][0]["id"]
 
-r = call("GET", f"/accounts/{acct}/cfd_tunnel?name={sub}&is_deleted=false")
+r = call("GET", f"/accounts/{acct}/cfd_tunnel?name={tname}&is_deleted=false")
 if not r.get("success"):
     fail("cannot list tunnels", r)
 if r.get("result"):
     tid = r["result"][0]["id"]
-    print(f"NOTE=reusing existing tunnel '{sub}' ({tid})")
+    print(f"NOTE=reusing existing tunnel '{tname}' ({tid})")
+    # A CLI-created tunnel is "locally managed": Cloudflare never pushes ingress to it, so
+    # writing /configurations succeeds but cloudflared keeps serving 503. Refuse early.
+    d = call("GET", f"/accounts/{acct}/cfd_tunnel/{tid}")
+    src = (d.get("result") or {}).get("config_src")
+    if src != "cloudflare":
+        fail(f"tunnel '{tname}' is {src}-managed (config_src={src}); the API cannot push "
+             "ingress to it. Delete that tunnel in the dashboard and re-run, or keep it and "
+             "manage ingress with ~/.cloudflared/config.yml on the host")
 else:
-    r = call("POST", f"/accounts/{acct}/cfd_tunnel", {"name": sub, "config_src": "cloudflare"})
+    r = call("POST", f"/accounts/{acct}/cfd_tunnel", {"name": tname, "config_src": "cloudflare"})
     if not r.get("success"):
         fail("cannot create tunnel", r)
     tid = r["result"]["id"]
-    print(f"NOTE=created tunnel '{sub}' ({tid})")
+    print(f"NOTE=created tunnel '{tname}' ({tid})")
 
 r = call("GET", f"/accounts/{acct}/cfd_tunnel/{tid}/token")
 if not r.get("success"):
