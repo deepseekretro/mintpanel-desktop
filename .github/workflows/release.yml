@@ -1,0 +1,42 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write          # GITHUB_TOKEN can create the release; a PAT is not needed
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: sanity check the installer
+        run: |
+          bash -n install-deb-v3.sh
+          bash -n install-deb-v2.sh
+          grep -q 'supervisord is the only supervisor' install-deb-v3.sh
+
+      - name: verify the prebuilt binaries
+        run: |
+          for f in dist/websockify-go-linux-amd64 dist/websockify-go-linux-arm64; do
+            test -x "$f" || chmod +x "$f"
+            test -s "$f"
+            file "$f"
+          done
+
+      - name: publish release (all dist/ artefacts)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            install-deb-v3.sh
+            install-deb-v2.sh
+            dist/desktop-assets.tar.gz
+            dist/cf-ui.mjs
+            dist/fly-supervise.py
+            dist/websockify-go-linux-amd64
+            dist/websockify-go-linux-arm64
+            dist/mintpanel-bundle-x86_64.tar.gz
+          generate_release_notes: true
