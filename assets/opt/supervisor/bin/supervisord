@@ -1,0 +1,5 @@
+#!/bin/bash
+# pip --target 不会把 console_scripts 放进 PATH；直接 exec 真入口（shebang 接管，无需显式 python3）
+SV="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$SV/lib${PYTHONPATH:+:$PYTHONPATH}"
+exec "$SV/lib/bin/supervisord" "$@"
