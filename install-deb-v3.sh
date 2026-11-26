@@ -399,9 +399,14 @@ done
 PATCHELF="$OPT_DSK/bin/patchelf"
 if [ -x "$PATCHELF" ]; then
   echo "  -> Patching ELF RPATH -> $OPT_DSK/lib ..."
+  PATCHFAIL=0
   for f in "$OPT_DSK/bin"/*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
-    LD_LIBRARY_PATH="$OPT_DSK/lib" "$PATCHELF" --set-rpath "$OPT_DSK/lib" --force-rpath "$f" >/dev/null 2>&1 || true
+    # subshell so a patchelf crash does not print "Segmentation fault" from the parent shell
+    if ! ( LD_LIBRARY_PATH="$OPT_DSK/lib" "$PATCHELF" --set-rpath "$OPT_DSK/lib" --force-rpath "$f" ) >/dev/null 2>&1; then
+      PATCHFAIL=$((PATCHFAIL + 1))
+      [ "$PATCHFAIL" -le 6 ] && echo "     !! patchelf failed on bin/$(basename "$f")"
+    fi
   done
   for f in "$OPT_DSK/lib"/*.so*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
@@ -605,6 +610,9 @@ dl "$(rel_url desktop-assets.tar.gz)" "$STAGE/desktop-assets.tar.gz"
 tar xzf "$STAGE/desktop-assets.tar.gz" -C "$TARGET"
 
 mkdir -p "$OPT_SV/etc/conf.d" "$OPT_SV/bin" "$OPT_SV/run" "$OPT_SV/log" "$OPT_SV/lib"
+# cloudflared.conf is generated in step 6 only. An older/templated copy here would
+# still contain __TARGET__ placeholders and makes supervisord refuse to start.
+rm -f "$OPT_SV/etc/conf.d/cloudflared.conf"
 
 MISSING=0
 for f in "$OPT_DSK/bin/rsvg2wall.py" \
