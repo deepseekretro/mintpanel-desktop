@@ -589,8 +589,15 @@ CDN 后面更合适的是 **XHTTP**，`mode: packet-up` 对 cloudflared 这种 H
 ```json
 { "tag": "xhttp-in", "listen": "127.0.0.1", "port": 28444, "protocol": "vless",
   "settings": { "clients": [{ "id": "<uuid>", "email": "cdn@mint" }], "decryption": "none" },
-  "streamSettings": { "network": "xhttp", "xhttpSettings": { "path": "/rayws", "mode": "packet-up" } } }
+  "streamSettings": { "network": "xhttp", "xhttpSettings": { "path": "/rayws", "mode": "auto" } } }
 ```
+
+**服务端必须 `mode: "auto"`，客户端才指定 `packet-up`。** 服务端写死 `packet-up` 时，
+部分客户端的内置协商（先试 stream-up）会直接失败，表现就是「配置看着没错但连不上」。
+
+`stream-up` 在 Cloudflare 后面**不可用**（实测 10 MB 下行 = 0 B / 90 s 超时）：
+它依赖单向长 POST 上行流，cloudflared 与 CF 边缘都会缓冲/切断。`auto` 只是兼容期开关，
+实际生效的只能是 `packet-up`。
 
 面板 `server.mjs` 要同时支持两种形态：
 
