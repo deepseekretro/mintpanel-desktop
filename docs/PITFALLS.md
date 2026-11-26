@@ -168,3 +168,49 @@ No user exists for uid 1001
 | `cfd/run.sh` | `cfd/cloudflared` | quick tunnel → 某个本地端口，随机 `trycloudflare.com` 域名 |
 
 同名不同命，先看 `--config` 还是 `--url` 再判断。
+---
+
+## 10. raw CDN 会把「文件不存在」的 404 缓存很久
+
+**症状**：push 完一个新二进制，`raw.githubusercontent.com/<repo>/main/dist/<file>` 一直 404，
+而同一个仓库的其他文件（包括 63 MB 的）都正常 200。GitHub API 查 `contents` 明明在，
+blob 大小也对。
+
+**原因**：push 之前用那个 URL 探测过（当时文件确实不存在），CDN 把 404 缓存了。
+`?cache=1`、`?v=<timestamp>` 这些 query 都绕不过去。
+
+**实测三条路径**：
+
+```
+raw.githubusercontent.com/<repo>/main/dist/<file>          404
+github.com/<repo>/raw/main/dist/<file>                     404
+github.com/<repo>/blob/main/dist/<file>?raw=true           200
+raw.githubusercontent.com/<repo>/HEAD/dist/<file>          200   ← 用这个
+```
+
+**修法**：`BASE_URL` 用 `/HEAD/` 而不是 `/main/`；或者干脆改用 Release 附件
+（`https://github.com/<repo>/releases/latest/download/<file>`，走发布 CDN，不会有这个问题）。
+
+**教训**：探测「文件是否已经发布」时不要用最终要用的那个 URL——换一个，否则自己给自己
+埋一个缓存。
+
+---
+
+## 11. deploy key 建不了 Release，但 GitHub Actions 可以
+
+deploy key 的权限范围只有 git 传输（clone/fetch/push），够不着 REST API——
+所以 `POST /repos/{owner}/{repo}/releases` 和上传附件都做不了。
+
+绕过办法：在仓库里放一个 tag 触发的 workflow，用仓库自带的 `GITHUB_TOKEN` 建 release：
+
+```yaml
+on: push: tags: ["v*"]
+permissions:
+  contents: write
+steps:
+  - uses: softprops/action-gh-release@v2
+    with:
+      files: dist/*
+```
+
+deploy key 触发的 push 同样会触发 workflow。于是「没有 PAT」不再是障碍。
