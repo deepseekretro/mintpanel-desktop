@@ -535,3 +535,46 @@ vless://<uuid>@<panel-domain>:443?security=tls&type=ws&path=%2Frayws&host=<panel
 ```
 
 实测两条链路出口 IP 都是 `94.130.237.57`（Hetzner DE）。
+
+## 24. 手工打补丁后浏览器还在跑旧 JS
+
+**症状**：改完 `dist/client/_astro/index.*.js`、接口返回值也确认了新值，但浏览器页面照旧（比如输入框还是隧道域名）。
+
+**根因**两层：
+
+1. `server.mjs` 的 `serveStatic` 只设 `Content-Type`，**没有 `Cache-Control` / `ETag` / `Last-Modified`**。
+   浏览器对这类响应走启发式缓存（按已有 age 的百分比续期），可能挂很久。
+2. Astro 的 `_astro/index.<hash>.js` 文件名是**构建期**内容 hash。手工改内容不改名字，缓存键完全不变。
+
+**修法**：
+
+```bash
+# 改名 = 换 cache key，浏览器必然重新下载
+new=$(md5sum dist/client/_astro/index.astro_astro_type_script_index_0_lang.OLD.js | cut -c1-8)
+mv ...OLD.js ...$new.js
+sed -i "s/OLD/$new/g" dist/server/manifest_*.mjs     # Astro manifest 里有两处引用
+```
+
+并在 `serveStatic` 里补缓存头（以后改什么都不用改名）：
+
+```js
+res.writeHead(200, {
+  "Content-Type": MIME[ext] || "application/octet-stream",
+  "Cache-Control": "no-store, must-revalidate"
+});
+```
+
+**另外**：`localStorage.node_custom_host` 优先级最高。旧版面板会把当前访问域名自动写进这个框，
+若被 `onCustomHostChange` 落盘，之后永远返回那个值。`q()` 里加清洗：
+
+```js
+if (e && e === location.hostname) { localStorage.removeItem("node_custom_host"); e = ""; }
+```
+
+**验证**（camoufox 三个上下文）：
+
+| 场景 | 期望 |
+|---|---|
+| 干净浏览器 | 显示探测到的直连域名 |
+| `localStorage = 隧道域名` | 值被删除，仍显示直连域名 |
+| `localStorage = 自定义域名` | 尊重用户输入 |
