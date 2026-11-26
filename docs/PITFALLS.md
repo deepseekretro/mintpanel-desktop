@@ -271,3 +271,44 @@ supervisord 对日志目录是**硬要求**，目录不存在就整个不启动�
 - 安装/验证时用**固定 tag**：`releases/download/v1.3.3/...`，立刻一致
 - 发版后自检要看**响应体 md5**，不是 HTTP 200
 - `latest` 适合长期入口，不适合「刚发完版马上装」
+
+## 16. 覆盖安装时 `cp: Text file busy`
+
+在一台**已装好 v3** 的机器上重跑安装脚本，第 4 步（把 deb 摊平进 `opt/desktop`）失败：
+
+```
+cp: cannot create regular file '/home/container/opt/desktop/bin/./x11vnc': Text file busy
+```
+
+`ETXTBSY` 的成因是**有进程正在执行那个文件**，`cp` 不能用新内容覆盖正在跑的镜像。
+v3 之后 `opt/desktop` 完全归 supervisord 管，而 Step 0 原来只杀：
+
+- `opt/mintpanel/.panel.pid`
+- `opt/desktop/logs/*.pid`
+- `cloudflared`
+- Camoufox（仅 `INSTALL_BROWSER=1` 时）
+
+supervisord 自己没被杀，于是它托管的 Xvfb / openbox / tint2 / x11vnc / websockify
+继续持有 `bin/*` 的映射 → 第 4 步必炸。
+
+正确顺序：
+
+```bash
+"$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" shutdown
+pkill -f "$OPT_SV/lib/bin/supervisord"          # 只杀本前缀的
+pkill -f "$OPT_DSK/xvfb-run\.sh"
+pkill -f "$OPT_DSK/bin/websockify" / x11vnc / tint2 / openbox / Xvfb
+for _i in $(seq 1 15); do                        # 等镜像彻底 unmapped
+  [ "$(pgrep -f "$OPT_DSK/(bin|lib)/" | wc -l)" -eq 0 ] && break
+  sleep 1
+done
+pkill -9 -f "$OPT_DSK/(bin|lib)/"                # 兜底
+```
+
+两点提醒：
+
+- **必须等**，不能只发 SIGTERM 就往下走：`stat()` 到 `cp` 之间进程可能还没退干净
+- `pkill -f "$OPT_DSK/(bin|lib)/"` 不会打死脚本自己（脚本 cmdline 里没有这个路径），
+  但**别写成 `pkill -f opt/desktop`**，那样会把安装进程自己也算进去
+
+另外第 4 步的 bin 合并现在带一次重试：万一有迟到的进程重新抓住文件，杀掉后重拷一次。
