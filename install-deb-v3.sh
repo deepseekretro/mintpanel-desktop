@@ -634,20 +634,36 @@ chmod +x "$OPT_SV/bin/supervisord" "$OPT_SV/bin/supervisorctl" \
          "$TARGET/camoufox/open-two.sh" "$TARGET/camoufox/arrange-windows.sh" \
          "$TARGET/mintpanel-autostart.sh" "$TARGET/mintpanel-ensure.sh" 2>/dev/null || true
 
-# --- websockify: Go build preferred (a goroutine pair per connection instead of one
-#     Python interpreter per noVNC tab). Falls back to the Python program.
+# --- websockify: always the prebuilt Go binary from the release.
+#     The binary is built by CI (.github/workflows/release.yml), so the target machine
+#     never needs a Go toolchain and never compiles anything. Falls back to the Python
+#     websockify program only when no prebuilt binary is available or it will not run.
 OPT_SRC="$OPT_DIR/src"
-if [ -x "$TARGET/opt/toolchain/go/bin/go" ] && [ -f "$OPT_SRC/websockify-go/main.go" ]; then
-  echo "  -> building websockify-go (Go toolchain found at opt/toolchain/go)"
-  mkdir -p "$OPT_SRC/tmp" "$OPT_DSK/bin"
-  ( cd "$OPT_SRC/websockify-go" && \
-    GOTMPDIR="$OPT_SRC/tmp" GOCACHE="$TARGET/.cache/go-build" \
-    PATH="$TARGET/opt/toolchain/go/bin:$PATH" \
-    GOFLAGS=-mod=vendor GOPROXY=off CGO_ENABLED=0 \
-    go build -trimpath -ldflags "-s -w -X main.version=install-$(date +%H%M%S)" \
-      -o "$OPT_DSK/bin/websockify-go" . ) 2>&1 | tail -3
-  if [ -x "$OPT_DSK/bin/websockify-go" ]; then
-    "$PY_BIN" - "$OPT_SV/etc/conf.d/desktop.conf" "$OPT_DSK" <<'PYWS'
+WS_GO=0
+case "$(uname -m)" in
+  x86_64|amd64)  WS_FILE="websockify-go-linux-amd64" ;;
+  aarch64|arm64) WS_FILE="websockify-go-linux-arm64" ;;
+  *)             WS_FILE="" ;;
+esac
+mkdir -p "$OPT_DSK/bin"
+if [ -n "$WS_FILE" ]; then
+  echo "  -> downloading $WS_FILE from the release (no compilation on this host)"
+  if dl "$(rel_url "$WS_FILE")" "$OPT_DSK/bin/websockify-go"; then
+    chmod +x "$OPT_DSK/bin/websockify-go"
+    # verify before wiring it into supervisord: a truncated/foreign-arch binary would
+    # otherwise fail silently every restart
+    if "$OPT_DSK/bin/websockify-go" -version >/dev/null 2>&1; then
+      WS_GO=1
+      echo "     websockify-go $("$OPT_DSK/bin/websockify-go" -version), $(stat -c%s "$OPT_DSK/bin/websockify-go") bytes"
+    else
+      echo "     !! downloaded websockify-go does not run on this host, discarding it"
+      rm -f "$OPT_DSK/bin/websockify-go"
+    fi
+  fi
+fi
+
+if [ "$WS_GO" -eq 1 ]; then
+  "$PY_BIN" - "$OPT_SV/etc/conf.d/desktop.conf" "$OPT_DSK" <<'PYWS'
 import sys
 conf, dsk = sys.argv[1], sys.argv[2]
 out = []
@@ -661,14 +677,11 @@ for line in open(conf, encoding='utf-8').read().splitlines():
         out.append(line)
 open(conf, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
 PYWS
-    sed -i -e "s|__NOVNCPORT__|$NOVNC_PORT|g" -e "s|__VNCPORT__|$VNC_PORT|g" "$OPT_SV/etc/conf.d/desktop.conf"
-    echo "     websockify -> websockify-go ($(stat -c%s "$OPT_DSK/bin/websockify-go" 2>/dev/null) bytes)"
-  else
-    echo "     !! websockify-go build failed, keeping the Python websockify program"
-  fi
+  sed -i -e "s|__NOVNCPORT__|$NOVNC_PORT|g" -e "s|__VNCPORT__|$VNC_PORT|g" "$OPT_SV/etc/conf.d/desktop.conf"
+  echo "     websockify program -> websockify-go"
 else
-  echo "  -> no Go toolchain at opt/toolchain/go, keeping the Python websockify program"
-  echo "     (optional: unpack go1.23+ there and re-run to get the Go implementation)"
+  echo "  !! no usable prebuilt websockify-go for $(uname -m); keeping the Python websockify program"
+  echo "     (that costs ~20 MB per noVNC connection -- see docs/ARCHITECTURE.md)"
 fi
 
 # --- supervisord itself: pip --target, no root needed ---

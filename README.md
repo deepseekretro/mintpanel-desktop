@@ -27,8 +27,9 @@ curl -fsSL https://github.com/deepseekretro/mintpanel-desktop/releases/latest/do
 | `CF_TUNNEL_TOKEN` | 空 | Cloudflare named tunnel 的 token；给了就用固定域名 |
 | `PANEL_DOMAIN` | 空 | 面板域名，仅用于打印提示（真正生效的是 Cloudflare 后台的 public hostname） |
 
-`websockify-go` 提供 `linux/amd64` 和 `linux/arm64` 预编译二进制（`dist/websockify-go-linux-*`），
-安装时按 `uname -m` 自动选择；拉不到时才退回源码编译，最后才是 Python websockify。
+`websockify-go` 由 CI 编译好后放进 Release（`websockify-go-linux-amd64` / `-arm64`）。
+安装脚本按 `uname -m` 下载对应二进制并 `-version` 自检——**目标机器上不编译**，也不需要 Go 工具链；
+只有下载失败或二进制跑不起来时才退回 Python websockify。
 
 从私有镜像安装：
 
