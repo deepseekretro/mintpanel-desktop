@@ -529,6 +529,20 @@ fi
 # Step 5: Desktop configs + supervisord program set
 # ------------------------------------------------------------------
 echo "[5/7] Writing desktop configs & supervisord program set (supervisord is the only supervisor)..."
+
+# x11vnc needs a password: this build leaves 5900 reachable on the container ULA address
+# no matter what -no6/-rfbportv6/-allow say, and the desktop usually has a logged-in
+# browser. Reuse the existing file so a reinstall keeps the link working.
+mkdir -p "$TARGET/.vnc"
+if [ -s "$TARGET/.vnc/passwd" ]; then
+  VNC_PW="(preserved - see $TARGET/.vnc/passwd)"
+else
+  VNC_PW=$("$PY_BIN" -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters+string.digits) for _ in range(8)))')
+  if ! LD_LIBRARY_PATH="$OPT_DSK/lib" "$OPT_DSK/bin/x11vnc" -storepasswd "$VNC_PW" "$TARGET/.vnc/passwd" >/dev/null 2>&1; then
+    printf '%s' "$VNC_PW" > "$TARGET/.vnc/passwd"
+  fi
+fi
+chmod 600 "$TARGET/.vnc/passwd" 2>/dev/null || true
 PY_BIN=""
 for cand in "$(command -v python3 2>/dev/null || true)" "$TARGET/python/bin/python3" "/usr/bin/python3"; do
   if [ -n "$cand" ] && [ -x "$cand" ]; then
@@ -1260,6 +1274,8 @@ echo "   Browser    : $( [ "$INSTALL_BROWSER" = "1" ] && echo "installed ($TARGE
 echo "   Supervisor : $OPT_SV/bin/supervisord -c $OPT_SV/etc/supervisord.conf"
 "$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" status 2>/dev/null | sed 's/^/                /' || true
 echo "   Desktop    : programs = xvfb / openbox / tint2 / x11vnc / websockify / healthcheck"
+echo "   Desktop URL: ${ENTRY_URL%/}/novnc/vnc.html?password=${VNC_PW}&autoconnect=true"
+echo "   VNC passwd : ${VNC_PW}  (~/.vnc/passwd)"
 echo "   Wallpaper  : $OPT_DSK/share/wallpaper/debian13-ceratopsian.svg (set once by xvfb-run.sh)"
 echo "   Entry point: openbox right-click menu / F1 -> camoufox/open-two.sh (no desktop icon)"
 echo "   .bashrc    : no autostart hook (supervisord owns liveness)"
