@@ -383,30 +383,48 @@ grep -nE '\| *(tail|head|grep|sed|awk|wc|tr)[^|]*$' install-deb-v3.sh \
 这类 bug 的迷惑性在于：**每次报错位置都不一样**（上一个坑挡住了下一个），看似"修不完"。
 实际上全部来自同一条 `set -euo pipefail`。
 
-## 18. 面板域名访问 `/vnc.html` 是 404 —— noVNC 需要自己的 hostname
+## 18. 不要为 noVNC 单独开一个公网 hostname —— 它没有鉴权
 
-装完打开 `https://<panel>/vnc.html` 得到面板的 404 页面，`https://<panel>/__stats` 也是 404。
+现象：装完 `https://<panel>/vnc.html` 是 404，于是"顺手"给 websockify 的 6080 加了一条
+ingress（`<sub>-vnc.<zone> -> 127.0.0.1:6080`）。桌面能用了，但**任何人拿到这个 hostname
+都能直接接管桌面**——`x11vnc` 默认是 `-nopw`，websockify 也不校验任何东西。
+桌面里通常开着浏览器，浏览器里通常是已登录的会话。
 
-原因：MintPanel 监听 8090，websockify/noVNC 监听 6080，是**两个独立监听**，面板**不反代**
-noVNC 路径（面板里的 `/novnc` 是它自己那套容器桌面实现，跟 `opt/desktop/share/novnc` 无关）。
-tunnel 的 ingress 只写了一条 `hostname -> 127.0.0.1:8090`，6080 根本没有入口。
+**正确入口是面板自带的 `/novnc` 反代**，`server.mjs` 里两处都校验 `mintpanel_session`：
 
-所以桌面访问必须是第二个 hostname：
-
-```json
-{
-  "ingress": [
-    {"hostname": "nodaroo-02.10w123.com",     "service": "http://127.0.0.1:8090"},
-    {"hostname": "nodaroo-02-vnc.10w123.com", "service": "http://127.0.0.1:6080"},
-    {"service": "http_status:404"}
-  ]
+```js
+function proxyNovncHttp(req, res) {
+  if (!isAuthedReq(req)) { res.writeHead(401, ...); return; }   // 未登录 401
+  ...proxy to NOVNC_HOST:NOVNC_PORT
 }
+
+server.on("upgrade", (req, socket, head) => {
+  if (!url.includes("websockify")) return socket.destroy();
+  if (!isAuthedReq(req)) { socket.end("HTTP/1.1 401 Unauthorized\r\n\r\n"); return; }
+  ...proxy to 127.0.0.1:6080/websockify
+});
 ```
 
-同时要建对应的 DNS CNAME（`<同样指向 <tunnel-id>.cfargotunnel.com`，proxied）。
-`CF_API_TOKEN` 模式现在会自动做这件事，第二条域名默认 `<sub>-vnc.<zone>`：
+所以：
 
-- 覆盖：`CF_VNC_DOMAIN=vnc.example.com`
-- 关掉：`CF_NO_VNC=1`
+| 入口 | 鉴权 |
+|---|---|
+| `https://<panel>/novnc/vnc.html` | 面板登录态（HTTP 与 WS 都校验）✓ |
+| `https://<sub>-vnc.<zone>/vnc.html` | **无** ✗ |
 
-判定方法：`curl -s -o /dev/null -w '%{http_code}' https://<panel>/vnc.html` —— 404 就是只配了一条。
+验证方法（`--http1.1` 是必须的，HTTP/2 下 Cloudflare 对 Upgrade 直接 400）：
+
+```bash
+curl -s -i --http1.1 -H "Cookie: mintpanel_session=$SESS" \
+  -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+  -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  https://<panel>/novnc/websockify        # 有 cookie -> 101，没有 -> 401
+```
+
+纵深防御：即使走面板代理，`x11vnc` 也应带 `-rfbauth`（`-storepasswd` 生成 8 字符，
+`chmod 600`），这样单独拿到 5900/6080 也进不去。
+
+脚本策略（v1.4.7 起）：默认**不建**公开 VNC hostname；只有 `CF_VNC_DOMAIN=...` 显式给出才建，
+并在安装时打印警告。真需要直连就配 Cloudflare Access（本账号 Zero Trust 已启用，
+`/accounts/{a}/access/apps` 可用）。
+

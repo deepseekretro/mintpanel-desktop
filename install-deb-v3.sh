@@ -55,8 +55,9 @@ mintpanel-desktop installer
   0) CF_API_TOKEN=<token> PANEL_DOMAIN=<host>
      全自动：脚本用细粒度 API token 建/复用 tunnel、写 ingress、建 DNS CNAME，
      然后把「每隧道 token」写进 supervisord。API token 只在安装时用一次，不落盘。
-     面板在 :8090、noVNC 在 :6080，是两个监听，所以会自动再建一条
-     <host 前缀>-vnc.<域> 指向 :6080（CF_VNC_DOMAIN 可覆盖，CF_NO_VNC=1 可关闭）。
+     桌面走面板自带的 /novnc 反代（HTTP + WebSocket 都校验 mintpanel_session），
+     所以默认不额外暴露 :6080。确实要直连 noVNC 时才给 CF_VNC_DOMAIN=...，
+     那等于把桌面公开出去（除非再加 Cloudflare Access）。
      需要的权限：Account > Cloudflare Tunnel > Edit、Zone > DNS > Edit、
                  Zone > Zone > Read（给了 CF_ZONE_ID 可省）
   1) CF_TUNNEL_TOKEN=<token>
@@ -80,10 +81,12 @@ DESK_URL=""
 if [ -n "$CF_API_TOKEN" ] && [ -n "$PANEL_DOMAIN" ]; then
   ENTRY_MODE="named tunnel (CF_API_TOKEN, provisioned via API)"
   ENTRY_URL="https://$PANEL_DOMAIN"
-  if [ -n "${CF_NO_VNC:-}" ]; then
-    DESK_URL=""
+  # The panel already proxies /novnc (HTTP + WebSocket) behind mintpanel_session, so the
+  # desktop needs no public hostname. A separate VNC hostname is opt-in only.
+  if [ -n "${CF_VNC_DOMAIN:-}" ]; then
+    DESK_URL="https://$CF_VNC_DOMAIN/vnc.html  (PUBLIC, no auth unless you add Cloudflare Access)"
   else
-    DESK_URL="https://${CF_VNC_DOMAIN:-${PANEL_DOMAIN%%.*}-vnc.${PANEL_DOMAIN#*.}}/vnc.html"
+    DESK_URL="https://$PANEL_DOMAIN/novnc/vnc.html  (behind the panel login)"
   fi
 elif [ -n "$CF_TUNNEL_TOKEN" ]; then
   ENTRY_MODE="named tunnel (CF_TUNNEL_TOKEN)"
@@ -861,12 +864,15 @@ CF_PROG="$OPT_SV/etc/conf.d/cloudflared.conf"
 # --- optional: provision the tunnel through the Cloudflare API -------------------------
 #     This is the fine-grained alternative to `cloudflared tunnel login`: no cert.pem and
 #     no account-wide credential ever lands on this host, only the per-tunnel token.
-# noVNC/websockify is a separate listener, so it needs its own hostname: the panel does
-# not proxy /vnc.html. Derive <sub>-vnc.<zone>, overridable by CF_VNC_DOMAIN, and
-# skippable with CF_NO_VNC=1.
+# Desktop access goes through the panel's own /novnc proxy, which enforces mintpanel_session
+# on both the HTTP and the WebSocket upgrade. Publishing websockify directly on a hostname
+# would hand the whole desktop (and whatever cookies the browser holds) to anyone with the
+# URL, so a public VNC hostname is opt-in only: set CF_VNC_DOMAIN to enable it.
 VNC_DOMAIN="${CF_VNC_DOMAIN:-}"
-if [ -z "$VNC_DOMAIN" ] && [ -n "$PANEL_DOMAIN" ] && [ -z "${CF_NO_VNC:-}" ]; then
-  VNC_DOMAIN="${PANEL_DOMAIN%%.*}-vnc.${PANEL_DOMAIN#*.}"
+if [ -n "$VNC_DOMAIN" ]; then
+  echo "  !! CF_VNC_DOMAIN is set: noVNC will be reachable WITHOUT authentication."
+  echo "     Anyone with the hostname gets keyboard/mouse on the desktop. Put Cloudflare"
+  echo "     Access in front of it, or drop the variable and use https://<panel>/novnc/."
 fi
 if [ -n "$CF_API_TOKEN" ] && [ -n "$PANEL_DOMAIN" ]; then
   echo "  -> provisioning the tunnel through the Cloudflare API ($PANEL_DOMAIN)"
