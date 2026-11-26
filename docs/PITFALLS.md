@@ -214,3 +214,60 @@ steps:
 ```
 
 deploy key 触发的 push 同样会触发 workflow。于是「没有 PAT」不再是障碍。
+---
+
+## 12. 无控制终端时 `[ -r /dev/tty ]` 是假的
+
+setsid / nohup / CI 里跑安装脚本，`/dev/tty` 这个设备节点仍然存在且可读，`[ -r /dev/tty ]`
+返回真；真正失败的是**打开**它的那一刻（ENXIO）。在 `set -e` 下，`printf ... >/dev/tty`
+直接把整个安装干掉：
+
+```
+install-v3.sh: line 125: /dev/tty: No such device or address
+```
+
+正确探针是「能不能真的打开」：
+
+```bash
+if { exec 3<>/dev/tty; } 2>/dev/null; then
+  printf "..." >&3; read -r ans <&3; exec 3>&-
+else
+  ans="默认值"
+fi
+```
+
+## 13. assets 里带着未替换占位符的模板，supervisord 一声不响就死
+
+`cloudflared.conf` 模板残留 `__TARGET__` 占位符，被解包进 `conf.d/`，而负责替换的 `sed`
+循环只覆盖了白名单里的文件。supervisord 首次启动直接拒绝：
+
+```
+Error: The directory named as part of the path __TARGET__/opt/mintpanel/cf-named.log
+does not exist in section 'program:cloudflared'
+```
+
+之后再怎么 `supervisorctl status` 都只是 `.../supervisor.sock no such file`，看不出根因。
+
+**两条规矩**：
+1. 每个 conf 文件只能有一个生成者（`cloudflared.conf` 只由 step 6 写，assets 里不许带）
+2. 启动前 `rm -f` 掉可能继承的旧副本，别指望它一定是干净的
+
+## 14. `stdout_logfile` 的目录没人创建
+
+`desktop.conf` 里每个 program 都写 `stdout_logfile=opt/desktop/logs/*.log`，但安装脚本
+从来没 `mkdir` 过 `opt/desktop/logs`。在老机器上能跑，因为手工安装时顺手建过；换新机器就是
+
+```
+Error: The directory named as part of the path .../opt/desktop/logs/xvfb.log does not exist
+```
+
+supervisord 对日志目录是**硬要求**，目录不存在就整个不启动（不是单个 program 失败）。
+
+## 15. `releases/latest/download` 的缓存按边缘节点独立
+
+发版后本机 `curl` 立刻拿到新附件，目标机却还是旧内容（`md5sum` 不变）。CDN 缓存 TTL
+大约 30–60 秒，且各节点不同步。
+
+- 安装/验证时用**固定 tag**：`releases/download/v1.3.3/...`，立刻一致
+- 发版后自检要看**响应体 md5**，不是 HTTP 200
+- `latest` 适合长期入口，不适合「刚发完版马上装」
