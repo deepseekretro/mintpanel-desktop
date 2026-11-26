@@ -312,3 +312,47 @@ pkill -9 -f "$OPT_DSK/(bin|lib)/"                # 兜底
   但**别写成 `pkill -f opt/desktop`**，那样会把安装进程自己也算进去
 
 另外第 4 步的 bin 合并现在带一次重试：万一有迟到的进程重新抓住文件，杀掉后重拷一次。
+
+## 17. `set -o pipefail` + 命令替换 = 静默自杀
+
+现象：覆盖安装跑到 Step 0 最后一步直接没了，日志停在 `[0/7] 停止已有相关进程准备覆盖安装...`，
+`bash -x` 的 trace 结尾是：
+
+```
++ _alive=0
++ cleanup
++ rm -rf '/home/container/.mintpanel-deb-stage-$'
+```
+
+注意 `_alive=0` 和 `cleanup` 之间**没有** `+ '[' 0 -eq 0 ']'`，说明脚本在赋值那一行就退出了，
+`cleanup` 只是 `trap ... EXIT` 的收尾，**没人杀它**。
+
+原因：
+
+```bash
+set -euo pipefail
+_alive=$(pgrep -f "$OPT_DSK/(bin|lib)/" 2>/dev/null | wc -l)
+```
+
+- 进程清空后 `pgrep` 无匹配 → 退出码 **1**
+- `pipefail` 让整条管道的退出码取最右非零 → **1**（不是 `wc` 的 0）
+- 赋值语句因此失败 → `set -e` 直接终止脚本
+
+`pgrep | wc -l` 是最容易中招的组合：`wc` 永远成功，看起来"不会失败"。同类的还有
+`ls dir/*.deb | wc -l`（目录空时 `ls` 返回 2）、`grep -c`、`ss | grep`。
+
+两个修法，任选：
+
+```bash
+n=$(pgrep -f pattern | wc -l || true)      # || 作用在整条管道上
+n=$( { pgrep -f pattern || true; } | wc -l)
+```
+
+排查命令：
+
+```bash
+grep -nE '=\$\([^)]*\| *(wc|head|tail|awk)' install-deb-v3.sh
+```
+
+**隔离实验也要带 `set -e` 才有意义**：我第一版复现脚本写成 `set -uo pipefail`，
+少了 `-e`，同样代码跑得好好的，白绕一圈。
