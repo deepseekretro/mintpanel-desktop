@@ -627,3 +627,25 @@ if (cols.length >= 4 && cols[1].endsWith(":" + hexPort) && cols[3] === "0A") ret
 `xraylib` 里的 `checkJavaXrayRunning()`、`server.mjs` 里的 `isTcpPortBound()` 两处都要改。
 
 **验收**（真客户端，xhttp 配置不填 flow）：经隧道出口 IP 与直连一致。
+
+## 26. `action=restart` 只写文件，不重载内嵌 xray
+
+**症状**：改完 xray config（例如 `xhttpSettings.mode` 从 `packet-up` 改成 `auto`），调
+`POST /api/xraylib {"action":"restart"}` 返回 `{"ok":true}`，监听也还在，但客户端行为完全没变。
+
+**根因**：面板的内嵌 xray 是**同一个 Node 进程里的 native 库实例**（`yabs_xray.node` + `libxray.so`）。
+`save_config` 把配置写进 vault 和 `/tmp/xray/config.json`，`restart` 只做了「文件层面的重启」，
+没有 `os.Exit`/重新 `Start()` 那个 native 实例 —— 内存里跑的还是旧配置。
+
+**判断方法**：
+
+```bash
+ps -o pid,lstart,etime -p $(pgrep -f 'mintpanel/server.mjs')
+```
+
+面板进程启动时间没变 = native 实例大概率没重载。
+
+**正确做法**：改完配置后到面板 UI 点「重启 Xray」按钮（它会走真正的 native 重载），
+或者重启整个面板进程。CLI 的 `action=restart` 不足以让新配置生效。
+
+**验证**：改完立刻用真客户端连一次；同时看 `panel.log` 里 `[xhttp-in >> direct]` 计数是否增长。
