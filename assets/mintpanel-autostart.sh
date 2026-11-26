@@ -23,7 +23,10 @@ log "hook start (HOME=$HOME, DISPLAY_NUM=${DISPLAY_NUM:-99})"
 ctl() { "$SV/bin/supervisorctl" -c "$CONF" "$@" 2>/dev/null; }
 
 if [ -f "$CONF" ] && [ -d "$SV/lib/supervisor" ]; then
-  if pgrep -f 'supervisor\.supervisord.*opt/supervisor/etc' >/dev/null 2>&1; then
+  # 判活不要写死调用形式：`supervisorctl pid` 对 wrapper（bin/supervisord）
+  # 和 `python -m supervisor.supervisord` 两种启动方式都成立；按 cmdline 匹配
+  # 的正则很容易漏掉其中一种，于是每次钩子都再起一个（第二个会因 socket 占用退出）。
+  if ctl pid >/dev/null 2>&1; then
     log "supervisord already running"
   else
     log "starting supervisord"

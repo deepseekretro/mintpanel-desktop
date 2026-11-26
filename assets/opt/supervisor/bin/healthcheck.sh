@@ -7,11 +7,29 @@ H=__TARGET__
 ctl() { PYTHONPATH="$SV/lib" "$PY" -m supervisor.supervisorctl -c "$SV/etc/supervisord.conf" "$@" >>"$SV/log/healthcheck.log" 2>&1; }
 log() { echo "[$(date '+%F %T')] $*"; }
 
+# x11vnc: a wedged process still accepts connections but never answers RFB -> restart.
+# Two deployment modes: TCP 5900 (default) or `-unixsock` (no TCP listener at all, used
+# when the container's private address is reachable from neighbours). Read the mode from
+# the program config instead of guessing from the socket file: a dead x11vnc removes its
+# socket too, and we would then probe the wrong thing and never restart it.
+VNC_UNIX=$(cat "$SV"/etc/conf.d/*.conf 2>/dev/null \
+  | grep -v '^[[:space:]]*[;#]' \
+  | sed -n 's/.*-unixsock[[:space:]]\{1,\}\([^[:space:]]*\).*/\1/p' | head -n1)
+if [ -n "$VNC_UNIX" ]; then
+  VNC_PROBE=("rfbunix" "$VNC_UNIX")
+else
+  VNC_PROBE=("rfb" "5900")
+fi
+
 while :; do
-  # x11vnc: wedged processes still hold 5900 but never answer RFB -> restart
-  if ! "$PY" "$SV/bin/probe.py" rfb 5900; then
-    log "x11vnc not answering RFB -> restart"
-    ctl restart x11vnc
+  # Two attempts: at boot this loop starts before Xvfb/x11vnc are listening, and a
+  # single probe would kill a perfectly healthy x11vnc that is 2 s old.
+  if ! "$PY" "$SV/bin/probe.py" "${VNC_PROBE[@]}"; then
+    sleep 4
+    if ! "$PY" "$SV/bin/probe.py" "${VNC_PROBE[@]}"; then
+      log "x11vnc not answering RFB (${VNC_PROBE[0]} ${VNC_PROBE[1]}) -> restart"
+      ctl restart x11vnc
+    fi
   fi
   # websockify
   if ! "$PY" "$SV/bin/probe.py" port 6080; then

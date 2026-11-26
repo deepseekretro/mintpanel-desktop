@@ -808,3 +808,66 @@ curl -s -b <cookie> https://<面板域>/api/xraylib | python3 -c "import sys,jso
 
 **警告**：`/tmp` 在部分平台是持久化的（容器重启不重建时）。所以「重启就好」并不成立，
 旧 config 会一直生效，必须人工核对或代码里加校验。
+
+## 29. 健康检查探错端口 = 每 30 s 杀掉一次健康的 x11vnc
+
+**现象**：noVNC 画面每隔半分钟黑一下再恢复；`supervisord.log` 里 x11vnc
+`spawned -> success -> SIGKILL -> spawned` 无限循环，间隔恰好 32 s。
+
+**原因**：`healthcheck.sh` 原本写死 `probe.py rfb 5900`（TCP）。而为了不在容器的
+私有网段上暴露 VNC（无密码），x11vnc 改成了 `-rfbport 0 -rfbportv6 -1 -unixsock ~/.vnc/vnc.sock`，
+**根本没有 TCP 5900**。于是探测永远失败，健康检查每次都「治」一次 —— 把好进程杀了。
+
+**修法**：从 program 配置里读出模式，再选探测方式，别用「socket 文件在不在」猜
+（x11vnc 死了 socket 也没了，猜错就永远不重启）。
+
+```bash
+VNC_UNIX=$(cat "$SV"/etc/conf.d/*.conf 2>/dev/null \
+  | grep -v '^[[:space:]]*[;#]' \
+  | sed -n 's/.*-unixsock[[:space:]]\{1,\}\([^[:space:]]*\).*/\1/p' | head -n1)
+if [ -n "$VNC_UNIX" ]; then VNC_PROBE=("rfbunix" "$VNC_UNIX"); else VNC_PROBE=("rfb" "5900"); fi
+```
+
+`probe.py` 同时加了 `rfbunix <path>`（AF_UNIX + 真的收 12 字节 `RFB 003.008`）。
+另外探测失败要**重试一次再重启**：开机时 healthcheck 可能比 Xvfb/x11vnc 先起来，
+单次探测会把 2 秒大的进程误杀一次。
+
+## 30. 容器重启后整套服务没起来：`app.py` 缺自启钩子
+
+**现象**：PaaS 重启容器后 `supervisord` / 面板 / cloudflared / xray 全都不在，
+但 remote-bash agent 在线（所以「机器还活着」，很容易误判成服务挂了）。
+
+**原因**：这个镜像族（Pterodactyl 式 python 容器）的 STARTUP 只有
+`python /home/container/app.py`，而 `app.py` 是**平台给的最小引导**：下载
+`remote-bash-agent.py` 然后 `os.execv` 成 agent。它不会跑 `mintpanel-autostart.sh`，
+所以桌面栈、面板、隧道都等着没人叫。
+
+判据（一条就够）：
+
+```bash
+ps -o etime= -p 1        # PID1 只有几分钟 = 刚重启过
+grep -c spawn_autostart ~/app.py   # 0 = 没有钩子
+pgrep -fc supervisord              # 0 = 服务栈没起
+```
+
+**修法**：给 `app.py` 加 `spawn_autostart()`（在 `download_script()` 之后、`execv` 之前
+用独立会话提交），安装脚本 v1.8.1 起会**自动打这个补丁**（幂等、`py_compile` 校验、
+失败自动回滚备份）。别把钩子塞进 `.bashrc`：xterm 里的交互式 shell 会重跑桌面启动，
+历史上就是这么把 Xvfb 打死的（见 §22 一带的记录）。
+
+## 31. `pack-assets.sh`：desktop-assets.tar.gz 不能只打子目录
+
+`dist/desktop-assets.tar.gz` 是安装脚本 step 5 唯一的桌面资产来源，它**必须**包含
+`camoufox/`、`mintpanel-autostart.sh`、`mintpanel-ensure.sh`、`opt/supervisor/*`、
+`opt/desktop/{bin,share}`。手工 `tar czf ... opt/supervisor opt/desktop/bin` 打出来的包
+少了三样，安装脚本的 `missing desktop asset` 检查会直接 abort。
+
+**永远从 `assets/` 整体打包**：
+
+```bash
+./pack-assets.sh    # tar -C assets .  + 必需文件自查
+```
+
+顺带一个 bash 坑：自查时不要写 `tar tzf "$OUT" | grep -qx ./file`。
+`grep -q` 命中即退出 → tar 收到 SIGPIPE → 在 `set -o pipefail` 下整条管道返回 141，
+结果永远是「文件缺失」。先 `LIST=$(tar tzf ...)` 再 `grep -qxF <<<"$LIST"`。

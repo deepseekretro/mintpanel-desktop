@@ -1048,7 +1048,7 @@ grep -h '^\[program:' "$OPT_SV/etc/conf.d/"*.conf 2>/dev/null | sed 's/^/       
 
 # --- boot supervisord and wait for the whole set ---
 echo "  -> booting supervisord"
-pkill -f 'supervisor\.supervisord.*opt/supervisor/etc' 2>/dev/null || true
+pkill -f 'supervisord.*-c .*opt/supervisor/etc/supervisord\.conf' 2>/dev/null || true
 sleep 1
 setsid nohup "$OPT_SV/bin/supervisord" -c "$OPT_SV/etc/supervisord.conf" </dev/null >/dev/null 2>&1 &
 SV_BOOTED=0
@@ -1492,6 +1492,86 @@ if [ ! -S "$OPT_SV/run/supervisor.sock" ]; then
   sleep 5
 fi
 "$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" start all 2>&1 | tail -8 || true
+
+# ------------------------------------------------------------------
+# app.py: the only boot hook a PaaS container gives us
+# ------------------------------------------------------------------
+# The platform runs `python app.py` as STARTUP; app.py downloads the agent and
+# execs it. Nothing else runs on boot, so the desktop stack stays down unless
+# app.py calls mintpanel-autostart.sh first. Patch it in place (idempotent,
+# syntax-checked, backed up) instead of asking the user to edit it by hand.
+if [ -f "$TARGET/app.py" ]; then
+  "$PY_BIN" - "$TARGET/app.py" <<'APPEOF'
+import os, py_compile, shutil, sys, time
+
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+
+if "spawn_autostart" in src:
+    print("  -> app.py already has spawn_autostart()")
+    raise SystemExit(0)
+
+FUNC = '''
+AUTOSTART_HOOK = BASE_DIR / "mintpanel-autostart.sh"
+
+
+def spawn_autostart():
+    """在 exec agent 之前拉起桌面栈 / 面板 / 隧道 / 浏览器。
+
+    平台重启容器后不会替我们启动这些，钩子必须自己跑。用独立会话后台提交，
+    避免阻塞 agent 启动；脚本本身幂等，重复调用无副作用。
+    """
+    if not AUTOSTART_HOOK.exists():
+        log("未找到 mintpanel-autostart.sh，跳过自启钩子")
+        return
+
+    try:
+        subprocess.Popen(
+            ["/bin/bash", str(AUTOSTART_HOOK)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env={**os.environ, "MINTPANEL_DIR": str(BASE_DIR)},
+        )
+        log(f"已提交自启钩子：{AUTOSTART_HOOK}")
+    except Exception as error:
+        log(f"自启钩子提交失败：{type(error).__name__}: {error}")
+
+'''
+
+edits = [
+    ("import os\n", "import os\nimport subprocess\n"),
+    ('SCRIPT_PATH = BASE_DIR / "remote-bash-agent.py"\n',
+     'SCRIPT_PATH = BASE_DIR / "remote-bash-agent.py"\n'),
+    ("def main():\n", FUNC.lstrip("\n") + "\ndef main():\n"),
+    ("    download_script()\n", "    download_script()\n\n    spawn_autostart()\n"),
+]
+# The constant block already ends with SCRIPT_PATH; keep the list above minimal:
+# the function carries AUTOSTART_HOOK, so only three real substitutions are needed.
+edits = [e for e in edits if e[0] != e[1]]
+
+for old, new in edits:
+    if src.count(old) != 1:
+        print(f"  !! app.py patch anchor not unique ({old!r}: {src.count(old)}x), skipped")
+        raise SystemExit(0)
+    src = src.replace(old, new)
+
+backup = path + ".bak-" + time.strftime("%s")
+shutil.copy2(path, backup)
+open(path, "w", encoding="utf-8").write(src)
+try:
+    py_compile.compile(path, doraise=True)
+except Exception as error:
+    shutil.copy2(backup, path)
+    print(f"  !! app.py patch broke the file ({error}), restored from {backup}")
+    raise SystemExit(0)
+os.remove(path + "c") if os.path.exists(path + "c") else None
+print(f"  -> app.py patched (spawn_autostart), backup {os.path.basename(backup)}")
+APPEOF
+else
+  echo "  -> no $TARGET/app.py (not a PaaS bootstrap container), skipped"
+fi
 
 # app.py calls this on every container boot (spawn_autostart); it is idempotent
 if [ -x "$TARGET/mintpanel-autostart.sh" ]; then
