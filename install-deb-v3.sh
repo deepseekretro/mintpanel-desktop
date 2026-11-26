@@ -609,7 +609,7 @@ echo "[5/7] (cont.) Fetching desktop assets -> $TARGET ..."
 dl "$(rel_url desktop-assets.tar.gz)" "$STAGE/desktop-assets.tar.gz"
 tar xzf "$STAGE/desktop-assets.tar.gz" -C "$TARGET"
 
-mkdir -p "$OPT_SV/etc/conf.d" "$OPT_SV/bin" "$OPT_SV/run" "$OPT_SV/log" "$OPT_SV/lib"
+mkdir -p "$OPT_SV/etc/conf.d" "$OPT_SV/bin" "$OPT_SV/run" "$OPT_SV/log" "$OPT_SV/lib" "$OPT_DSK/logs"
 # cloudflared.conf is generated in step 6 only. An older/templated copy here would
 # still contain __TARGET__ placeholders and makes supervisord refuse to start.
 rm -f "$OPT_SV/etc/conf.d/cloudflared.conf"
@@ -739,10 +739,22 @@ echo "  -> booting supervisord"
 pkill -f 'supervisor\.supervisord.*opt/supervisor/etc' 2>/dev/null || true
 sleep 1
 setsid nohup "$OPT_SV/bin/supervisord" -c "$OPT_SV/etc/supervisord.conf" </dev/null >/dev/null 2>&1 &
+SV_BOOTED=0
 for i in $(seq 1 30); do
-  [ -S "$OPT_SV/run/supervisor.sock" ] && break
+  [ -S "$OPT_SV/run/supervisor.sock" ] && { SV_BOOTED=1; break; }
   sleep 1
 done
+if [ "$SV_BOOTED" -eq 0 ]; then
+  # A config error makes supervisord exit before it ever writes the socket; run it in the
+  # foreground once so its own message lands in the installer output instead of nowhere.
+  echo "  !! supervisord did not create $OPT_SV/run/supervisor.sock"
+  echo "     --- supervisord's own complaint ---"
+  timeout 5 "$OPT_SV/bin/supervisord" -c "$OPT_SV/etc/supervisord.conf" -n 2>&1 \
+    | grep -v 'pkg_resources\|UserWarning\|import pkg_resources' | head -6 | sed 's/^/     /'
+  echo "     --- conf.d ---"
+  ls -1 "$OPT_SV/etc/conf.d" 2>/dev/null | sed 's/^/     /'
+  exit 1
+fi
 "$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" start all 2>&1 | tail -8
 
 RUNNING=0
