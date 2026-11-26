@@ -193,7 +193,10 @@ pkill -x tint2 2>/dev/null || true
 pkill -x openbox 2>/dev/null || true
 # wait for the images to be unmapped before step 4 starts overwriting them
 for _i in $(seq 1 15); do
-  _alive=$(pgrep -f "$OPT_DSK/(bin|lib)/" 2>/dev/null | wc -l)
+  # `|| true` is load-bearing: with `set -o pipefail` a no-match pgrep returns 1,
+  # which would abort the whole installer through `set -e` the moment the last
+  # process exits.
+  _alive=$(pgrep -f "$OPT_DSK/(bin|lib)/" 2>/dev/null | wc -l || true)
   [ "$_alive" -eq 0 ] && break
   sleep 1
 done
@@ -401,7 +404,7 @@ printf "%s\n" "$URIS" | xargs -P 8 -I{} sh -c '
   curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 "$u" -o "$f" 2>/dev/null
 ' _ {} "$STAGE/debs"
 
-HAVE=$(ls "$STAGE/debs"/*.deb 2>/dev/null | wc -l)
+HAVE=$(ls "$STAGE/debs"/*.deb 2>/dev/null | wc -l || true)
 if [ "$HAVE" -lt "$URI_COUNT" ]; then
   echo "  -> $HAVE/$URI_COUNT downloaded, serializing the rest with dl() ..."
   printf "%s\n" "$URIS" | while IFS= read -r u; do
@@ -410,7 +413,7 @@ if [ "$HAVE" -lt "$URI_COUNT" ]; then
     [ -s "$f" ] && continue
     dl "$u" "$f" || echo "     !! failed: $(basename "$u")"
   done
-  HAVE=$(ls "$STAGE/debs"/*.deb 2>/dev/null | wc -l)
+  HAVE=$(ls "$STAGE/debs"/*.deb 2>/dev/null | wc -l || true)
 fi
 echo "  -> $HAVE/$URI_COUNT .deb files ready"
 if [ "$HAVE" -lt "$URI_COUNT" ]; then
@@ -792,7 +795,7 @@ done
 chmod +x "$OPT_SV/lib/bin/"* 2>/dev/null || true
 
 # --- program set sanity check (supervisord is the ONLY supervisor) ---
-NPROG=$(grep -h '^\[program:' "$OPT_SV/etc/conf.d/"*.conf 2>/dev/null | wc -l)
+NPROG=$(grep -h '^\[program:' "$OPT_SV/etc/conf.d/"*.conf 2>/dev/null | wc -l || true)
 echo "  -> $NPROG supervisord programs declared:"
 grep -h '^\[program:' "$OPT_SV/etc/conf.d/"*.conf 2>/dev/null | sed 's/^/       /'
 [ "$NPROG" -ge 6 ] || { echo "  !! expected >=6 programs, aborting"; exit 1; }
