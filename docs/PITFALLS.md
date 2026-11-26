@@ -701,3 +701,110 @@ GET  /api/xraylib   -> 401   (需要登录)
 GET  /novnc/vnc.html-> 401   (需要登录)
 真客户端经 CF 拉大文件 -> 出口 IP 与直连一致
 ```
+
+## 28. PaaS 只给一个端口（`SERVER_PORT`），端口对不上就没有直连
+
+**症状**：面板生成的直连链接（REALITY / hysteria2）连不通，隧道那条却正常。
+
+**真正的根因几乎总是端口**，而不是协议、证书或防火墙。PaaS 容器只暴露一个公网端口，
+写在环境变量 `SERVER_PORT` 里；而面板的 xray/hy2 配置是**磁盘上的旧文件**，里面记的
+还是上一次生成时的端口（或别的机器上的端口），新代码的默认值只对「配置不存在」生效。
+
+实测两台机器的遗留值：
+
+| 机器 | `SERVER_PORT` | 旧 config 实际监听 | 结果 |
+|---|---|---|---|
+| nodaroo-01 | `25917` | xray `30649`、hy2 `:38573` | 两条直连都不通 |
+| nodaroo-02 | `26064` | xray `26064` | 正常 |
+
+**必须先改配置再测端口，否则会得到假阴性。** 我第一次判断 nodaroo-01「没有入站通道」
+就是错的：平台把 `25917` DNAT 进容器，但 xray 监听 `30649`，SYN 无人接管被丢弃，
+从外面看和「没有映射」完全一样。把 inbound 改到 `25917` 后立刻通了 ——
+**验证映射是否存在的唯一可靠方法是让服务监听那个端口，不能靠扫端口猜。**
+
+**域名不在环境变量里。** PaaS 只注入端口，域名得自己维护：
+
+```
+PUBLIC_NODE_HOST   → 生成链接里的 host（hy2lib/xraylib 都读它）
+PANEL_DIRECT_HOST  → server.mjs 的 detectDirectHost() 候选，校验 A 记录 == 容器出口 IP
+./.direct_host     → 同上，文件形式，一行一个候选
+```
+
+三个都不配时，前端 `q()` 会退回到 `location.hostname`，也就是**隧道域名**
+（`xxx.10w123.com`，解析到 Cloudflare 边缘）—— 拿它做 REALITY 握手必然失败。
+判断方法：`curl -sD - -o /dev/null https://<面板域>/ | grep panel_direct_host`，
+没有这个 cookie 就说明三个都没配。
+
+```bash
+# 正确配置（start.sh 里）
+export PANEL_DIRECT_HOST="${PANEL_DIRECT_HOST:-se2.nodaroo.fun}"
+export PUBLIC_NODE_HOST="${PUBLIC_NODE_HOST:-se2.nodaroo.fun}"
+echo 'se2.nodaroo.fun' > .direct_host
+```
+
+**hysteria2 与 xray 共用同一个端口号**（UDP / TCP，互不冲突）。nodaroo-01 现在：
+hy2 `UDP 25917`、xray `TCP 25917`、隧道 `/rayws` → `127.0.0.1:28444`。
+
+**硬编码兜底端口是定时炸弹。** 现在代码写的是：
+
+```js
+const NODE_PORT = Number(process.env.SERVER_PORT || 25675);
+```
+
+`25675` 在没有 `SERVER_PORT` 的平台上会安静地生成 `host:25675` 的链接 ——
+在共享 PaaS 上那可能是**邻居容器**。看起来正常、实际连到别人机器，比报错危险得多。
+注释里其实已经写了这一点，但代码没落实。
+
+**待发版（v1.9.0）**：端口三级兜底 + host 三级兜底 + 无值就不出直连链接
+
+```js
+// 端口：PaaS 各家注入的变量不同
+const PUBLIC_PORT =
+  Number(process.env.SERVER_PORT)   ||   // nodaroo / 多数 PaaS
+  Number(process.env.WEBSITES_PORT) ||   // Azure App Service
+  Number(process.env.PORT)          ||   // Railway / Render / Fly / Heroku
+  0;
+
+// host：域名 > 探测到的出口 IP > 不给
+const HOST = process.env.PUBLIC_NODE_HOST || await detectEgressIp() || null;
+
+const HAS_DIRECT = PUBLIC_PORT > 0 && !!HOST;
+// HAS_DIRECT 为 false 时不生成 direct 链接，node_info.port = null
+```
+
+**出口 IP 为什么能当兜底**：`detectDirectHost()` 本来就在做「候选域名的 A 记录
+== 容器出口 IP」的比对，出口 IP 这份数据已经拿到了，只是没拿它当 host。
+实测 nodaroo-01：`REALITY` 与 `hysteria2` 用 `16.16.127.139:25917` 直连，
+出口均正确 —— **REALITY 的 `sni` 与连接目标是两回事**，`sni` 只是伪装字段，
+`address` 填 IP 完全可用；hy2 用 `insecure: 1` 也不受影响。
+
+但 IP 当 **首选** 有三个真风险，所以只能当兜底：
+
+| 风险 | 说明 |
+|---|---|
+| 出口 ≠ 入站 | NAT 池场景下出站走 A、入站映射到 B，拿到一个连不进的 IP（本机是 1:1 NAT，恰好一致） |
+| IP 会变 | 重新调度 / 迁移 / 重建容器后失效 |
+| 无法自证 | 面板在容器内，验证不了「外面能否从这个 IP:PORT 进来」；出口 IP 是「我出去的地址」，不等于「别人能进来的地址」 |
+
+因此优先级固定为：**人工域名 > 探测出口 IP > null（不出直连）**，
+永远不要回落到硬编码值。
+
+改动点：`astro-panel/src/pages/api/hy2lib.astro.ts`、`xraylib.astro.ts`、
+`server.mjs` 的 cookie 段。同步四处：本仓库 `dist/`、nodaroo-02、nodaroo-01、pingless-in-shell。
+
+**自检命令**（查完再改）：
+
+```bash
+# 1. 平台给的端口
+env | grep -E '^SERVER_PORT='
+# 2. 实际监听
+ss -ltn | grep -E ':(25917|30649)'; ss -lunp | grep node
+# 3. 配置里的 listen / inbound port
+head -1 /tmp/hy2/config.yaml
+python3 -c "import json;c=json.load(open('/tmp/xray/config.json'));print([(i.get('port'),i.get('streamSettings',{}).get('network')) for i in c['inbounds']])"
+# 4. 链接里的端口是否与 SERVER_PORT 一致
+curl -s -b <cookie> https://<面板域>/api/xraylib | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['node_info'])"
+```
+
+**警告**：`/tmp` 在部分平台是持久化的（容器重启不重建时）。所以「重启就好」并不成立，
+旧 config 会一直生效，必须人工核对或代码里加校验。

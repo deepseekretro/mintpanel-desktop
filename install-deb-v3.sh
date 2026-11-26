@@ -26,6 +26,20 @@ fi
 VNC_PORT="${VNC_PORT:-5900}"
 NOVNC_PORT="${NOVNC_PORT:-6080}"
 DISPLAY_NUM="${DISPLAY_NUM:-99}"
+# PaaS 容器只给一个公开端口，写在 SERVER_PORT 里（Azure 叫 WEBSITES_PORT，
+# Railway/Render/Fly 叫 PORT）。xray 与 hy2 必须监听这个端口，否则从外面永远打不进来。
+# 三个变量都没有（裸 VPS 或自建网络）时才退化成随机高端口。
+PUBLIC_PORT="${SERVER_PORT:-${WEBSITES_PORT:-${PORT:-}}}"
+case "$PUBLIC_PORT" in
+  ''|*[!0-9]*) PUBLIC_PORT="" ;;
+esac
+if [ -n "$PUBLIC_PORT" ]; then
+  echo "  [port] using platform public port :$PUBLIC_PORT for xray(TCP) + hy2(UDP)"
+else
+  echo "  [port] no SERVER_PORT/WEBSITES_PORT/PORT -- xray/hy2 will get random ports"
+  echo "         (on a PaaS this means direct links cannot work; set one of them)"
+fi
+export MINT_PUBLIC_PORT="$PUBLIC_PORT"
 # Panel entry point. On an unfamiliar machine cloudflared has no authority of its
 # own over any domain -- the authorisation lives inside a tunnel token (or the
 # credentials JSON). Create the tunnel in the Cloudflare dashboard, set its public
@@ -367,6 +381,7 @@ else
   echo "        and will not connect. Re-run with PANEL_DIRECT_HOST=<your.direct.domain>"
 fi
 
+_MINT_DIRECT_HOST="$(head -1 "$OPT_PANEL/.direct_host" 2>/dev/null || true)"
 cat > "$OPT_PANEL/start.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -381,6 +396,11 @@ fi
 export PORT="\${PORT:-$PANEL_PORT}"
 export HOST="\${HOST:-127.0.0.1}"
 export WORKBENCH_DIR="\${WORKBENCH_DIR:-$OPT_PANEL}"
+# Node links must carry this machine's direct host, not the tunnel hostname. The panel
+# reads PUBLIC_NODE_HOST for that; baked in from .direct_host so a single-file install
+# already produces correct links.
+export PUBLIC_NODE_HOST="\${PUBLIC_NODE_HOST:-$_MINT_DIRECT_HOST}"
+export XRAY_WS_PORT="\${XRAY_WS_PORT:-28444}"
 nohup "$OPT_NODE/bin/node" "$OPT_PANEL/server.mjs" >> "$OPT_PANEL/panel.log" 2>&1 &
 echo \$! > "$OPT_PANEL/.panel.pid"
 echo "[MintPanel] started PID \$(cat "$OPT_PANEL/.panel.pid") on \$HOST:\$PORT"
@@ -410,6 +430,10 @@ import fs from "node:fs";
 import { execFileSync } from "node:child_process";
 import { loadVaultConfig, saveVaultConfig, seedEncryptedAssetIfEmpty } from "./vault.mjs";
 
+// Set by the installer from SERVER_PORT / WEBSITES_PORT / PORT. 0 means "no platform
+// port known", in which case each service falls back to a random high port.
+const PUBLIC_PORT = Number(process.env.MINT_PUBLIC_PORT || 0);
+
 if (!loadVaultConfig("hy2")) {
   const tmp = "/tmp/.hy2-seed-" + process.pid;
   fs.mkdirSync(tmp, { recursive: true });
@@ -417,7 +441,7 @@ if (!loadVaultConfig("hy2")) {
   seedEncryptedAssetIfEmpty("hy2_cert.pem", tmp + "/cert.pem");
   seedEncryptedAssetIfEmpty("hy2_key.pem", tmp + "/key.pem");
   fs.rmSync(tmp, { recursive: true, force: true });
-  const hyPort = 20000 + crypto.randomInt(25000);
+  const hyPort = PUBLIC_PORT || (20000 + crypto.randomInt(25000));
   const hyPass = crypto.randomBytes(18).toString("base64url");
   const hyYaml = [
     "listen: :" + hyPort,
@@ -434,14 +458,14 @@ if (!loadVaultConfig("hy2")) {
     "    rewriteHost: true"
   ].join("\n") + "\n";
   saveVaultConfig("hy2", hyYaml, true);
-  console.log("  -> Seeded random Hysteria2 on UDP :" + hyPort);
+  console.log("  -> Seeded Hysteria2 on UDP :" + hyPort + (PUBLIC_PORT ? " (platform public port)" : " (random)"));
 }
 
 if (!loadVaultConfig("xray")) {
   const { privateKey } = crypto.generateKeyPairSync("x25519");
   const pkcs8 = privateKey.export({ format: "der", type: "pkcs8" });
   const privB64 = pkcs8.subarray(pkcs8.length - 32).toString("base64url");
-  const xrPort = 20000 + crypto.randomInt(25000);
+  const xrPort = PUBLIC_PORT || (20000 + crypto.randomInt(25000));
   const uuid = crypto.randomUUID();
   const shortId = crypto.randomBytes(4).toString("hex");
   const xrJson = {
@@ -469,8 +493,19 @@ if (!loadVaultConfig("xray")) {
     }],
     outbounds: [{ protocol: "freedom", tag: "direct" }]
   };
+  // CDN transport: cloudflared -> nginx/panel /rayws -> here. Local-only port, so it is
+  // independent of the single public port the PaaS hands us.
+  const wsPort = Number(process.env.XRAY_WS_PORT || 28444);
+  xrJson.inbounds.push({
+    tag: "xhttp-in",
+    listen: "127.0.0.1",
+    port: wsPort,
+    protocol: "vless",
+    settings: { clients: [{ id: uuid, email: "cdn@mint" }], decryption: "none" },
+    streamSettings: { network: "xhttp", xhttpSettings: { path: "/rayws", mode: "auto" } }
+  });
   saveVaultConfig("xray", JSON.stringify(xrJson, null, 2), true);
-  console.log("  -> Seeded random Xray VLESS+REALITY on TCP :" + xrPort);
+  console.log("  -> Seeded Xray VLESS+REALITY on TCP :" + xrPort + " + XHTTP 127.0.0.1:" + wsPort);
 }
 SEEDEOF
 )
