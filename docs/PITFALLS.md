@@ -578,3 +578,45 @@ if (e && e === location.hostname) { localStorage.removeItem("node_custom_host");
 | 干净浏览器 | 显示探测到的直连域名 |
 | `localStorage = 隧道域名` | 值被删除，仍显示直连域名 |
 | `localStorage = 自定义域名` | 尊重用户输入 |
+
+## 25. 隧道链路用 XHTTP (packet-up)，不要 ws
+
+`ws` 在 xray 25+ 已被标记 deprecated（`This feature WebSocket transport is deprecated`），
+CDN 后面更合适的是 **XHTTP**，`mode: packet-up` 对 cloudflared 这种 HTTP/1.1 反代最省事。
+
+服务端：
+
+```json
+{ "tag": "xhttp-in", "listen": "127.0.0.1", "port": 28444, "protocol": "vless",
+  "settings": { "clients": [{ "id": "<uuid>", "email": "cdn@mint" }], "decryption": "none" },
+  "streamSettings": { "network": "xhttp", "xhttpSettings": { "path": "/rayws", "mode": "packet-up" } } }
+```
+
+面板 `server.mjs` 要同时支持两种形态：
+
+- 普通 HTTP（XHTTP 用）：任何 `/rayws*` 请求 → `http.request` 转发到上游，`req.pipe` / `res.pipe` 双向流式
+- upgrade（兼容旧 ws）：`/rayws` 的 upgrade → `net.connect` 裸转发
+
+客户端链接：
+
+```
+vless://<uuid>@<panel-domain>:443?security=tls&encryption=none&type=xhttp&mode=packet-up&path=%2Frayws&host=<panel-domain>&sni=<panel-domain>&fp=chrome
+```
+
+### 端口别用 28443
+
+面板用 `/proc/net/tcp` 里出现 `:6F1B`（=28443）判断「Java 插件在跑」，命中就**跳过 Node 端启动** xray。
+一旦把 CDN 入口放在 28443，面板就会一直认为 Java 插件活着，xray 永远起不来。用 28444。
+
+### 而且这个判断本身有坑
+
+`/proc/net/tcp` 里 `state=06`（TIME_WAIT）的残留连接也算「端口被绑」，所以要按状态过滤：
+
+```js
+// 只看 LISTEN(0A)
+if (cols.length >= 4 && cols[1].endsWith(":" + hexPort) && cols[3] === "0A") return true;
+```
+
+`xraylib` 里的 `checkJavaXrayRunning()`、`server.mjs` 里的 `isTcpPortBound()` 两处都要改。
+
+**验收**（真客户端，xhttp 配置不填 flow）：经隧道出口 IP 与直连一致。
