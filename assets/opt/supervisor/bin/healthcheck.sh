@@ -38,8 +38,14 @@ while :; do
   fi
   # panel + named tunnel (keep it short so a stuck tunnel can't block us)
   [ -x "$H/opt/mintpanel/ensure.sh" ] && timeout 25 bash "$H/opt/mintpanel/ensure.sh" >/dev/null 2>&1
-  # browser automation
-  if [ -x "$H/camoufox/open-two.sh" ] && ! pgrep -f 'camoufox/cf-ui\.mjs' >/dev/null 2>&1; then
+  # browser automation -- only when a browser is actually installed. With
+  # INSTALL_BROWSER=0 the launcher still exists (it ships in desktop-assets), so
+  # without this guard it retries "restart automation" every 30 s forever.
+  BROWSER_OK=0
+  [ -x "$H/cf-new/camoufox-bin" ] && BROWSER_OK=1
+  [ -d "$H/.cache/camoufox" ] && BROWSER_OK=1
+  if [ "$BROWSER_OK" = "1" ] && [ -x "$H/camoufox/open-two.sh" ] \
+     && ! pgrep -f 'camoufox/cf-ui\.mjs' >/dev/null 2>&1; then
     log "camoufox cf-ui.mjs gone -> open-two.sh"
     setsid nohup bash "$H/camoufox/open-two.sh" >>"$SV/log/healthcheck.log" 2>&1 </dev/null &
   fi
