@@ -120,7 +120,7 @@ dl() {
       return 0
     fi
     n=$((n+1))
-    err=$(tail -1 /tmp/.dl.err 2>/dev/null | tr -d '\r')
+    err=$(tail -1 /tmp/.dl.err 2>/dev/null | tr -d '\r' || true)
     if [ "$n" -ge 12 ]; then
       echo "[ERR] download failed after $n tries: $url ($err)"
       return 1
@@ -213,7 +213,7 @@ sleep 1
 # ------------------------------------------------------------------
 echo "[1/7] Downloading & installing official Node.js v22 -> $OPT_NODE ..."
 if [ ! -x "$OPT_NODE/bin/node" ]; then
-  NODE_TAR=$(curl -fsSL "https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt" | awk '/linux-x64\.tar\.gz$/{print $2; exit}')
+  NODE_TAR=$(curl -fsSL "https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt" | awk '/linux-x64\.tar\.gz$/{print $2; exit}' || true)
   [ -n "$NODE_TAR" ] || { echo "[ERR] Failed to resolve official Node.js v22 tarball"; exit 1; }
   echo "  -> Official: https://nodejs.org/dist/latest-v22.x/$NODE_TAR"
   dl "https://nodejs.org/dist/latest-v22.x/$NODE_TAR" "$STAGE/node.tar.gz"
@@ -371,7 +371,7 @@ APT_STATE_OPTS=(
 echo "  -> refreshing apt index into $STAGE/apt-state ..."
 if ! apt-get "${APT_STATE_OPTS[@]}" update 2>"$STAGE/apt-update.err"; then
   echo "  -> apt update failed, will fall back to system lists"
-  tail -3 "$STAGE/apt-update.err" 2>/dev/null | sed 's/^/     /'
+  tail -3 "$STAGE/apt-update.err" 2>/dev/null | sed 's/^/     /' || true
   APT_STATE_OPTS=()
 fi
 
@@ -392,7 +392,7 @@ if [ -z "$URIS" ]; then
   for p in $APT_PKGS; do
     apt-cache show "$p" >/dev/null 2>&1 || echo "        MISSING $p"
   done
-  echo "      free space check:"; df -h /tmp "$TARGET" 2>/dev/null | sed 's/^/     /'
+  echo "      free space check:"; df -h /tmp "$TARGET" 2>/dev/null | sed 's/^/     /' || true
   exit 1
 fi
 
@@ -796,8 +796,9 @@ chmod +x "$OPT_SV/lib/bin/"* 2>/dev/null || true
 
 # --- program set sanity check (supervisord is the ONLY supervisor) ---
 NPROG=$(grep -h '^\[program:' "$OPT_SV/etc/conf.d/"*.conf 2>/dev/null | wc -l || true)
+NPROG=${NPROG:-0}
 echo "  -> $NPROG supervisord programs declared:"
-grep -h '^\[program:' "$OPT_SV/etc/conf.d/"*.conf 2>/dev/null | sed 's/^/       /'
+grep -h '^\[program:' "$OPT_SV/etc/conf.d/"*.conf 2>/dev/null | sed 's/^/       /' || true
 [ "$NPROG" -ge 6 ] || { echo "  !! expected >=6 programs, aborting"; exit 1; }
 
 # --- boot supervisord and wait for the whole set ---
@@ -818,18 +819,18 @@ if [ "$SV_BOOTED" -eq 0 ]; then
   timeout 5 "$OPT_SV/bin/supervisord" -c "$OPT_SV/etc/supervisord.conf" -n 2>&1 \
     | grep -v 'pkg_resources\|UserWarning\|import pkg_resources' | head -6 | sed 's/^/     /'
   echo "     --- conf.d ---"
-  ls -1 "$OPT_SV/etc/conf.d" 2>/dev/null | sed 's/^/     /'
+  ls -1 "$OPT_SV/etc/conf.d" 2>/dev/null | sed 's/^/     /' || true
   exit 1
 fi
-"$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" start all 2>&1 | tail -8
+"$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" start all 2>&1 | tail -8 || true
 
 RUNNING=0
 for i in $(seq 1 20); do
-  RUNNING=$("$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" status 2>/dev/null | grep -c RUNNING)
-  [ "$RUNNING" -ge "$NPROG" ] && break
+  RUNNING=$("$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" status 2>/dev/null | grep -c RUNNING || true)
+  [ "${RUNNING:-0}" -ge "${NPROG:-1}" ] && break
   sleep 2
 done
-"$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" status 2>&1 | sed 's/^/       /'
+"$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" status 2>&1 | sed 's/^/       /' || true
 echo "  -> $RUNNING/$NPROG programs RUNNING"
 
 
@@ -1032,8 +1033,8 @@ else
   CF_WAIT_LOG="$OPT_PANEL/cf-panel.log"
 fi
 
-"$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" reread 2>&1 | tail -2
-"$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" update 2>&1 | tail -3
+"$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" reread 2>&1 | tail -2 || true
+"$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" update 2>&1 | tail -3 || true
 for i in $(seq 1 25); do
   grep -q 'Registered tunnel connection' "$CF_WAIT_LOG" 2>/dev/null && break
   sleep 1
@@ -1206,7 +1207,7 @@ if [ ! -S "$OPT_SV/run/supervisor.sock" ]; then
   setsid nohup "$OPT_SV/bin/supervisord" -c "$OPT_SV/etc/supervisord.conf" </dev/null >/dev/null 2>&1 &
   sleep 5
 fi
-"$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" start all 2>&1 | tail -8
+"$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" start all 2>&1 | tail -8 || true
 
 # app.py calls this on every container boot (spawn_autostart); it is idempotent
 if [ -x "$TARGET/mintpanel-autostart.sh" ]; then
@@ -1222,7 +1223,7 @@ echo "   $OPT_CF/bin/cloudflared"
 echo "   Java plugin: preserved (manual upload)"
 echo "   Browser    : $( [ "$INSTALL_BROWSER" = "1" ] && echo "installed ($TARGET/cf-new + 2 extensions)" || echo "skipped" )"
 echo "   Supervisor : $OPT_SV/bin/supervisord -c $OPT_SV/etc/supervisord.conf"
-"$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" status 2>/dev/null | sed 's/^/                /'
+"$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" status 2>/dev/null | sed 's/^/                /' || true
 echo "   Desktop    : programs = xvfb / openbox / tint2 / x11vnc / websockify / healthcheck"
 echo "   Wallpaper  : $OPT_DSK/share/wallpaper/debian13-ceratopsian.svg (set once by xvfb-run.sh)"
 echo "   Entry point: openbox right-click menu / F1 -> camoufox/open-two.sh (no desktop icon)"
