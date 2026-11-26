@@ -23,6 +23,13 @@ DISPLAY_NUM="${DISPLAY_NUM:-99}"
 # hostname to http://127.0.0.1:$PANEL_PORT, then pass the token here.
 PANEL_DOMAIN="${PANEL_DOMAIN:-}"
 CF_TUNNEL_TOKEN="${CF_TUNNEL_TOKEN:-}"
+# Optional: provision the tunnel automatically with a fine-grained API token.
+# Scopes needed: Account > Cloudflare Tunnel > Edit, Zone > DNS > Edit,
+# Zone > Zone > Read (skip the last one by passing CF_ZONE_ID).
+# The API token is used once during install; only the per-tunnel token is kept.
+CF_API_TOKEN="${CF_API_TOKEN:-}"
+CF_ACCOUNT_ID="${CF_ACCOUNT_ID:-}"
+CF_ZONE_ID="${CF_ZONE_ID:-}"
 
 OPT_DIR="$TARGET/opt"
 OPT_NODE="$OPT_DIR/node"
@@ -45,6 +52,11 @@ mintpanel-desktop installer
     | CF_TUNNEL_TOKEN=<token> PANEL_DOMAIN=panel.example.com bash
 
 面板对外入口，三选一：
+  0) CF_API_TOKEN=<token> PANEL_DOMAIN=<host>
+     全自动：脚本用细粒度 API token 建/复用 tunnel、写 ingress、建 DNS CNAME，
+     然后把「每隧道 token」写进 supervisord。API token 只在安装时用一次，不落盘。
+     需要的权限：Account > Cloudflare Tunnel > Edit、Zone > DNS > Edit、
+                 Zone > Zone > Read（给了 CF_ZONE_ID 可省）
   1) CF_TUNNEL_TOKEN=<token>
      Cloudflare dashboard > Zero Trust > Networks > Tunnels 里创建 tunnel，
      Public hostname 指向 http://127.0.0.1:8090，然后把 token 交给本脚本。
@@ -55,13 +67,17 @@ mintpanel-desktop installer
 其他变量：
   MINTPANEL_PORT=8090   MINTPANEL_DIR=$HOME   VNC_PORT=5900   NOVNC_PORT=6080
   DISPLAY_NUM=99        BASE_URL=<release>    TOKEN=<private mirror token>
+  CF_ACCOUNT_ID / CF_ZONE_ID  可选，省掉两次查询
   MINTPANEL_TOKEN=<hex> 面板访问口令；不给则沿用上一次安装的，只有全新机器才随机生成
 USAGE
   exit 0
 fi
 
 # 入口放在下载之前打印，避免装完才发现域名不对
-if [ -n "$CF_TUNNEL_TOKEN" ]; then
+if [ -n "$CF_API_TOKEN" ] && [ -n "$PANEL_DOMAIN" ]; then
+  ENTRY_MODE="named tunnel (CF_API_TOKEN, provisioned via API)"
+  ENTRY_URL="https://$PANEL_DOMAIN"
+elif [ -n "$CF_TUNNEL_TOKEN" ]; then
   ENTRY_MODE="named tunnel (CF_TUNNEL_TOKEN)"
   ENTRY_URL="https://${PANEL_DOMAIN:-<public hostname set in the Cloudflare dashboard>}"
 elif [ -f "$TARGET/.cloudflared/config.yml" ]; then
@@ -81,7 +97,7 @@ echo " Public URL : $ENTRY_URL"
 echo " Entry mode : $ENTRY_MODE"
 echo "=================================================="
 
-if [ -z "$CF_TUNNEL_TOKEN" ] && [ ! -f "$TARGET/.cloudflared/config.yml" ]; then
+if [ -z "$CF_TUNNEL_TOKEN" ] && [ -z "$CF_API_TOKEN" ] && [ ! -f "$TARGET/.cloudflared/config.yml" ]; then
   if [ -n "$PANEL_DOMAIN" ]; then
     echo "[WARN] PANEL_DOMAIN=$PANEL_DOMAIN is ignored: this machine has no cloudflared"
     echo "       credentials for it. A domain cannot be claimed from the machine side."
@@ -795,6 +811,123 @@ fi
 
 NAMED_CFG="$TARGET/.cloudflared/config.yml"
 CF_PROG="$OPT_SV/etc/conf.d/cloudflared.conf"
+
+# --- optional: provision the tunnel through the Cloudflare API -------------------------
+#     This is the fine-grained alternative to `cloudflared tunnel login`: no cert.pem and
+#     no account-wide credential ever lands on this host, only the per-tunnel token.
+if [ -n "$CF_API_TOKEN" ] && [ -n "$PANEL_DOMAIN" ]; then
+  echo "  -> provisioning the tunnel through the Cloudflare API ($PANEL_DOMAIN)"
+  CF_OUT=$("$PY_BIN" - "$CF_API_TOKEN" "$PANEL_DOMAIN" "$PANEL_PORT" <<'PYCF'
+import json, os, sys, urllib.request, urllib.error
+
+token, domain, port = sys.argv[1], sys.argv[2], sys.argv[3]
+API = "https://api.cloudflare.com/client/v4"
+HDR = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+def call(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(API + path, method=method, headers=HDR, data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        raw = e.read() or b"{}"
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {"errors": [{"message": raw[:120].decode("utf8", "replace")}]}
+    except Exception as e:
+        return {"errors": [{"message": str(e)[:120]}]}
+
+
+def fail(msg, resp=None):
+    errs = [e.get("message", "") for e in (resp or {}).get("errors", [])][:2]
+    print("ERROR=" + msg + (": " + "; ".join(errs) if errs else ""))
+    sys.exit(0)
+
+
+parts = domain.split(".")
+if len(parts) < 3:
+    fail("PANEL_DOMAIN must look like sub.zone.tld")
+sub, zone_name = parts[0], ".".join(parts[1:])
+
+acct = os.environ.get("CF_ACCOUNT_ID", "").strip()
+if not acct:
+    r = call("GET", "/accounts?per_page=1")
+    if not r.get("success") or not r.get("result"):
+        fail("cannot list accounts (need Account > Cloudflare Tunnel > Edit, or set CF_ACCOUNT_ID)", r)
+    acct = r["result"][0]["id"]
+
+zid = os.environ.get("CF_ZONE_ID", "").strip()
+if not zid:
+    r = call("GET", "/zones?name=" + zone_name)
+    if not r.get("success") or not r.get("result"):
+        fail(f"cannot resolve zone {zone_name} (need Zone > Zone > Read, or set CF_ZONE_ID)", r)
+    zid = r["result"][0]["id"]
+
+r = call("GET", f"/accounts/{acct}/cfd_tunnel?name={sub}&is_deleted=false")
+if not r.get("success"):
+    fail("cannot list tunnels", r)
+if r.get("result"):
+    tid = r["result"][0]["id"]
+    print(f"NOTE=reusing existing tunnel '{sub}' ({tid})")
+else:
+    r = call("POST", f"/accounts/{acct}/cfd_tunnel", {"name": sub, "config_src": "cloudflare"})
+    if not r.get("success"):
+        fail("cannot create tunnel", r)
+    tid = r["result"]["id"]
+    print(f"NOTE=created tunnel '{sub}' ({tid})")
+
+r = call("GET", f"/accounts/{acct}/cfd_tunnel/{tid}/token")
+if not r.get("success"):
+    fail("cannot fetch the tunnel token", r)
+tok = r["result"] if isinstance(r.get("result"), str) else (r.get("result") or {}).get("token", "")
+if not tok:
+    fail("tunnel token came back empty")
+
+r = call("PUT", f"/accounts/{acct}/cfd_tunnel/{tid}/configurations",
+         {"config": {"ingress": [{"hostname": domain, "service": f"http://127.0.0.1:{port}"},
+                                 {"service": "http_status:404"}]}})
+if not r.get("success"):
+    fail("cannot write the ingress config", r)
+print(f"NOTE=ingress {domain} -> http://127.0.0.1:{port}")
+
+r = call("GET", f"/zones/{zid}/dns_records?name={domain}")
+if not r.get("success"):
+    fail("cannot read DNS records (need Zone > DNS > Edit)", r)
+if r.get("result"):
+    print("NOTE=DNS record already present, left untouched")
+else:
+    r = call("POST", f"/zones/{zid}/dns_records",
+             {"type": "CNAME", "name": sub, "content": f"{tid}.cfargotunnel.com",
+              "proxied": True, "ttl": 1})
+    if not r.get("success"):
+        fail("cannot create the DNS record", r)
+    print("NOTE=DNS CNAME created (proxied) -> cfargotunnel.com")
+
+print(f"TUNNEL_ID={tid}")
+print(f"TUNNEL_TOKEN={tok}")
+PYCF
+)
+  CF_ERR=$(printf '%s\n' "$CF_OUT" | sed -n 's/^ERROR=//p')
+  if [ -n "$CF_ERR" ]; then
+    echo "  !! Cloudflare API refused: $CF_ERR"
+    echo "     required token scopes:"
+    echo "       Account > Cloudflare Tunnel > Edit"
+    echo "       Zone    > DNS > Edit"
+    echo "       Zone    > Zone > Read   (or pass CF_ZONE_ID to skip)"
+    exit 1
+  fi
+  printf '%s\n' "$CF_OUT" | sed -n 's/^NOTE=/     /p'
+  CF_TUNNEL_TOKEN=$(printf '%s\n' "$CF_OUT" | sed -n 's/^TUNNEL_TOKEN=//p')
+  CF_TUNNEL_ID=$(printf '%s\n' "$CF_OUT" | sed -n 's/^TUNNEL_ID=//p')
+  if [ -z "$CF_TUNNEL_TOKEN" ]; then
+    echo "  !! the API returned no tunnel token"
+    exit 1
+  fi
+  echo "     tunnel ready (${CF_TUNNEL_ID}), token kept in the supervisord conf only"
+fi
 
 # 三个分支共用的尾部
 cf_tail() {
