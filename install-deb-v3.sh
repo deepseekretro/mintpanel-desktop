@@ -543,6 +543,59 @@ for cand in "$(command -v python3 2>/dev/null || true)" "$TARGET/python/bin/pyth
   fi
 done
 
+# --- noVNC clipboard: the shipped core/rfb.js treats CutText as ISO-8859-1 and advertises
+#     the ExtendedClipboard pseudo-encoding. x11vnc sends the raw X selection bytes (UTF-8)
+#     and its libvncserver only half-implements ExtendedClipboard (answers a Notify with its
+#     own CutText and never Requests), so Chinese text comes out as "è¿ç¨ä¸æ" and pasting
+#     into the remote silently does nothing. Three idempotent edits, tagged [local patch].
+NOVNC_RFB="$OPT_DSK/share/novnc/core/rfb.js"
+if [ -f "$NOVNC_RFB" ]; then
+  "$PY_BIN" - "$NOVNC_RFB" <<'PYCLIP'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+if 'local patch' in s:
+    print("     noVNC clipboard patch: already applied")
+    raise SystemExit(0)
+edits = [
+    # 1) receive: x11vnc sends UTF-8 bytes; fall back to Latin-1 if they are not valid UTF-8
+    ("            //Standard msg\n            const text = this._sock.rQshiftStr(length);",
+     "            //Standard msg\n"
+     "            // [local patch] RFB says ISO-8859-1, but x11vnc sends the raw X selection\n"
+     "            // bytes (UTF-8). Decode as UTF-8, falling back to Latin-1 when invalid.\n"
+     "            const text = decodeUTF8(this._sock.rQshiftStr(length), true);"),
+    # 2) send: charCodeAt() truncates every non-Latin1 char, so encode to UTF-8 first
+    ("        } else {\n            let data = new Uint8Array(text.length);\n"
+     "            for (let i = 0; i < text.length; i++) {\n"
+     "                // FIXME: text can have values outside of Latin1/Uint8\n"
+     "                data[i] = text.charCodeAt(i);\n            }",
+     "        } else {\n"
+     "            // [local patch] x11vnc writes the received bytes straight into the X\n"
+     "            // selection (serving UTF8_STRING too), so send UTF-8 bytes, not truncated\n"
+     "            // charCode values.\n"
+     "            const utf8 = encodeUTF8(text);\n"
+     "            let data = new Uint8Array(utf8.length);\n"
+     "            for (let i = 0; i < utf8.length; i++) {\n"
+     "                data[i] = utf8.charCodeAt(i);\n            }"),
+    # 3) do not advertise the half-implemented extension: pasting must use plain CutText
+    ("        encs.push(encodings.pseudoEncodingExtendedClipboard);",
+     "        // [local patch] libvncserver 0.9.14 answers a Notify by re-sending its own\n"
+     "        // CutText and never sends Request, so browser->remote paste dies silently.\n"
+     "        // Keep the standard CutText path above instead.\n"
+     "        // encs.push(encodings.pseudoEncodingExtendedClipboard);"),
+]
+for old, new in edits:
+    if s.count(old) != 1:
+        print(f"     !! noVNC clipboard patch: pattern found {s.count(old)}x, skipping file")
+        raise SystemExit(0)
+    s = s.replace(old, new)
+open(p, 'w', encoding='utf-8').write(s)
+print("     noVNC clipboard patch: 3 edits applied (UTF-8 in/out, no ExtendedClipboard)")
+PYCLIP
+else
+  echo "     !! noVNC core/rfb.js not found, clipboard will stay Latin-1"
+fi
+
 
 mkdir -p "$OPT_DSK/etc/xdg/openbox"
 mkdir -p "$TARGET/.config/openbox"

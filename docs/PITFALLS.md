@@ -428,3 +428,17 @@ curl -s -i --http1.1 -H "Cookie: mintpanel_session=$SESS" \
 并在安装时打印警告。真需要直连就配 Cloudflare Access（本账号 Zero Trust 已启用，
 `/accounts/{a}/access/apps` 可用）。
 
+## 19. noVNC 中文剪贴板乱码（发给远端被截断 / 收进来是拉丁乱码）
+
+| 项 | 内容 |
+|---|---|
+| 症状 | 远端复制中文出来是 `è¿ç¨ä¸æ`；往远端粘贴中文没反应 |
+| 根因 A | x11vnc 的 `ServerCutText` 装的是 X selection 的**原始 UTF-8 字节**，noVNC 标准路径按 ISO-8859-1 逐字节拼串 |
+| 根因 B | `clipboardPasteFrom()` 用 `charCodeAt(i)` 截成单字节，非 Latin-1 字符全丢 |
+| 根因 C | libvncserver 0.9.14 的 ExtendedClipboard 只半实现：回 `Notify` 时重发自己的 CutText、从不 `Request` → 粘贴静默失效 |
+| 修法 | 对 `share/novnc/core/rfb.js` 打 3 处补丁（收 UTF-8 解码 / 发 UTF-8 编码 / 不宣告 ExtendedClipboard），全部带 `[local patch]` 标记 |
+| 安装脚本 | `install-deb-v3.sh` 步骤 5 自动打，幂等（已含 `local patch` 就跳过），输出 `noVNC clipboard patch: 3 edits applied` |
+| 检查 | `grep -c 'local patch' share/novnc/core/rfb.js` 应为 3 |
+| 会被覆盖吗 | 会。重装 `novnc` deb 会覆盖；重跑安装脚本会重新打 |
+
+详细配方与真浏览器验证方法见 `/root/NOVNC-CLIPBOARD.md`。
