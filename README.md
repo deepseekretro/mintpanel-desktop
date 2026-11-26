@@ -6,6 +6,32 @@
 > 目标环境：Pterodactyl / playhosting 这类容器 —— uid 1001、`/home/container`、
 > 无 systemd、无 root、`apt` 只读。这套脚本只用 `curl` + `dpkg-deb -x` + `patchelf` + `pip --target`。
 
+## 快速开始
+
+```bash
+# 全新容器，一条命令
+curl -fsSL https://raw.githubusercontent.com/deepseekretro/mintpanel-desktop/main/install-deb-v3.sh | bash
+```
+
+装完会打印 supervisord 的 program 状态和面板地址。可选环境变量：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `PANEL_PORT` | 8090 | MintPanel 监听端口 |
+| `VNC_PORT` | 5900 | x11vnc 端口 |
+| `NOVNC_PORT` | 6080 | websockify 端口 |
+| `DISPLAY_NUM` | 99 | X display 编号 |
+| `INSTALL_BROWSER` | 1 | 是否装 Camoufox（0 = 跳过） |
+| `BASE_URL` | 本仓库 `dist/` | 私有镜像时指向自己的 release 目录 |
+| `TOKEN` | 空 | 仅当 `BASE_URL` 需要鉴权时才设置 |
+
+从私有镜像安装：
+
+```bash
+BASE_URL=https://mirror.example/releases TOKEN=xxxx \
+  bash install-deb-v3.sh
+```
+
 ## 三十秒结论
 
 | 问题 | 答案 |
