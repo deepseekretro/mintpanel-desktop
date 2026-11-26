@@ -649,3 +649,55 @@ ps -o pid,lstart,etime -p $(pgrep -f 'mintpanel/server.mjs')
 或者重启整个面板进程。CLI 的 `action=restart` 不足以让新配置生效。
 
 **验证**：改完立刻用真客户端连一次；同时看 `panel.log` 里 `[xhttp-in >> direct]` 计数是否增长。
+
+## 27. 入口分流交给 nginx，不要用 Node 的 http 代理转发 XHTTP
+
+**实测差距**（同一条隧道、同一个 xray inbound、同一天）：
+
+| 分流实现 | 10 MB 下行 |
+|---|---|
+| Node `server.mjs` 里 `http.request` + `pipe` 转发 | 6.2 MB/s |
+| nginx `proxy_pass` | **15.3 MB/s** |
+
+Node 的 `http.request` 转发要走用户态拷贝、分块边界和它自己的 agent 连接池，长连接下行
+在高延迟链路上劣化明显；nginx 是零拷贝直通，并且 `proxy_buffering off` /
+`proxy_request_buffering off` 能把双向流式行为控制得很干净。
+
+**架构**：
+
+```
+cloudflared（云端 ingress = http://127.0.0.1:8090）
+  -> nginx 127.0.0.1:8090
+       location /rayws  -> 127.0.0.1:28444   (xray XHTTP inbound)
+       location /       -> 127.0.0.1:8091    (面板)
+```
+
+**为什么面板要退到 8091**：8090 必须让给 nginx，而 cloudflared 的 ingress 写在
+Cloudflare 后台（`config_src: cloudflare`），改本地参数无效。把面板挪走比改云端配置安全得多。
+
+**nginx 怎么装**（容器里 apt 只读、也没有 root）：
+
+```bash
+curl -s -o nginx.deb http://deb.debian.org/debian/pool/main/n/nginx/nginx_1.22.1-9+deb12u9_amd64.deb
+dpkg-deb -x nginx.deb "$HOME/opt/nginx"
+$HOME/opt/nginx/usr/sbin/nginx -p "$HOME/opt/nginx" -c "$HOME/opt/nginx/nginx.conf"
+```
+
+Debian 12 的 nginx 只依赖 `libpcre2-8-0` / `libssl3` / `zlib1g`，这些基础镜像里都有，
+不需要 `patchelf`，也不用编译。
+
+**launch 方式**：交给 supervisord（`priority=42`，早于 healthcheck），
+`-g "daemon off;"` 前台跑否则 supervisord 认为它退出了。它挂了＝整站不可达，必须 `autorestart=true`。
+
+**`set -e` 陷阱**：`[ "$ENTRY_PORT" = "$PANEL_PORT" ] && ENTRY_PORT=$((PANEL_PORT+1))`
+条件为假时整行返回 1，脚本直接静默退出。必须写成 `if ... then ... fi`。
+
+**验收顺序**（改完必须全走一遍）：
+
+```
+GET  /              -> 200   (面板)
+POST /rayws/probe   -> 400   (xray 应答)
+GET  /api/xraylib   -> 401   (需要登录)
+GET  /novnc/vnc.html-> 401   (需要登录)
+真客户端经 CF 拉大文件 -> 出口 IP 与直连一致
+```

@@ -13,14 +13,23 @@ rel_url() {
   fi
 }
 TARGET="${MINTPANEL_DIR:-$HOME}"
-PANEL_PORT="${MINTPANEL_PORT:-8090}"
+# 对外入口由 nginx 监听（cloudflared 的 ingress 指向它），面板本体退到 PANEL_PORT。
+# 拆成两层的唯一原因：xray 的 XHTTP 长连接不适合由 Node 的 http 代理转发，
+# nginx 能做到零缓冲双向流式，实测同一隧道吞吐 6.2 MB/s -> 15.3 MB/s。
+ENTRY_PORT="${ENTRY_PORT:-8090}"
+PANEL_PORT="${MINTPANEL_PORT:-8091}"
+# 注意：不能写成 `[ ... ] && ENTRY_PORT=...`——条件为假时整行返回 1，
+# 在 set -e 下会直接终止整个安装。
+if [ "$ENTRY_PORT" = "$PANEL_PORT" ]; then
+  ENTRY_PORT=$((PANEL_PORT + 1))
+fi
 VNC_PORT="${VNC_PORT:-5900}"
 NOVNC_PORT="${NOVNC_PORT:-6080}"
 DISPLAY_NUM="${DISPLAY_NUM:-99}"
 # Panel entry point. On an unfamiliar machine cloudflared has no authority of its
 # own over any domain -- the authorisation lives inside a tunnel token (or the
 # credentials JSON). Create the tunnel in the Cloudflare dashboard, set its public
-# hostname to http://127.0.0.1:$PANEL_PORT, then pass the token here.
+# hostname to http://127.0.0.1:$ENTRY_PORT (nginx entry), then pass the token here.
 PANEL_DOMAIN="${PANEL_DOMAIN:-}"
 CF_TUNNEL_TOKEN="${CF_TUNNEL_TOKEN:-}"
 # Optional: provision the tunnel automatically with a fine-grained API token.
@@ -36,6 +45,7 @@ OPT_NODE="$OPT_DIR/node"
 OPT_PANEL="$OPT_DIR/mintpanel"
 OPT_DSK="$OPT_DIR/desktop"
 OPT_SV="$OPT_DIR/supervisor"
+OPT_NGX="$OPT_DIR/nginx"
 STAGE="$TARGET/.mintpanel-deb-stage-$"
 
 cleanup() {
@@ -62,7 +72,7 @@ mintpanel-desktop installer
                  Zone > Zone > Read（给了 CF_ZONE_ID 可省）
   1) CF_TUNNEL_TOKEN=<token>
      Cloudflare dashboard > Zero Trust > Networks > Tunnels 里创建 tunnel，
-     Public hostname 指向 http://127.0.0.1:8090，然后把 token 交给本脚本。
+     Public hostname 指向 http://127.0.0.1:8090（nginx 入口），然后把 token 交给本脚本。
      机器上不需要任何域名权限，授权全在那个 token 里。
   2) 机器上已有 ~/.cloudflared/config.yml + credentials.json —— 直接复用。
   3) 两者都没有 —— 走 quick tunnel，随机 *.trycloudflare.com 域名，重启就变。
@@ -104,6 +114,7 @@ echo "=================================================="
 echo " MintPanel + Online .deb /opt Flattened Deployer"
 echo " Target     : $OPT_DIR"
 echo " Source     : $BASE_URL"
+echo " Entry port : $ENTRY_PORT  (nginx: /rayws -> xray, rest -> panel)"
 echo " Panel port : $PANEL_PORT"
 echo " Public URL : $ENTRY_URL"
 echo " Entry mode : $ENTRY_MODE"
@@ -143,6 +154,95 @@ dl() {
     sleep 4
   done
 }
+# nginx 只做入口分流：/rayws -> xray 的 XHTTP inbound，其余 -> 面板。
+# 容器里 apt 通常只读，所以不装包，直接解包 Debian 的 deb：不需要 root，也不需要编译。
+setup_nginx() {
+  local arch ver
+  case "$(uname -m)" in
+    x86_64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) echo "  !! nginx: unsupported arch $(uname -m) -- entry split disabled"; ENTRY_PORT="$PANEL_PORT"; return 0 ;;
+  esac
+  if [ -x "$OPT_NGX/usr/sbin/nginx" ]; then
+    echo "  -> nginx already unpacked"
+  else
+    echo "  -> fetching Debian nginx ($arch) ..."
+    mkdir -p "$OPT_NGX" "$STAGE/ngx"
+    ver=$(curl -fsSL --max-time 25 http://deb.debian.org/debian/pool/main/n/nginx/ 2>/dev/null \
+          | grep -o "nginx_1\.22\.1-[0-9]*+deb12u[0-9]*_${arch}\.deb" | sort -u | tail -1 || true)
+    [ -n "$ver" ] || ver="nginx_1.22.1-9+deb12u9_${arch}.deb"
+    if ! dl "http://deb.debian.org/debian/pool/main/n/nginx/$ver" "$STAGE/ngx/nginx.deb"; then
+      echo "  !! nginx download failed -- entry split disabled"; ENTRY_PORT="$PANEL_PORT"; return 0
+    fi
+    dpkg-deb -x "$STAGE/ngx/nginx.deb" "$OPT_NGX" || { ENTRY_PORT="$PANEL_PORT"; return 0; }
+  fi
+  [ -x "$OPT_NGX/usr/sbin/nginx" ] || { echo "  !! nginx unpack failed"; ENTRY_PORT="$PANEL_PORT"; return 0; }
+  mkdir -p "$OPT_NGX/tmp"/{body,proxy,fastcgi,uwsgi,scgi}
+  cat > "$OPT_NGX/nginx.conf" <<'NGX'
+worker_processes 1;
+error_log __PFX__/error.log warn;
+pid __PFX__/nginx.pid;
+
+events { worker_connections 1024; }
+
+http {
+    access_log off;
+    client_body_temp_path __PFX__/tmp/body;
+    proxy_temp_path       __PFX__/tmp/proxy;
+    fastcgi_temp_path     __PFX__/tmp/fastcgi;
+    uwsgi_temp_path       __PFX__/tmp/uwsgi;
+    scgi_temp_path        __PFX__/tmp/scgi;
+
+    map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+    server {
+        listen 127.0.0.1:__ENTRY__;
+        server_name _;
+        client_max_body_size 0;
+
+        # xray XHTTP：上行是并发 POST，下行是长连接流 —— 双向都不许缓冲
+        location /rayws {
+            proxy_pass http://127.0.0.1:28444;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header Connection "";
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_socket_keepalive on;
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+            chunked_transfer_encoding on;
+        }
+
+        # 面板 + noVNC（WebSocket upgrade 必须透传）
+        location / {
+            proxy_pass http://127.0.0.1:__PANEL__;
+            proxy_http_version 1.1;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_buffering off;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
+    }
+}
+NGX
+  sed -i -e "s|__PFX__|$OPT_NGX|g" -e "s|__ENTRY__|$ENTRY_PORT|g" -e "s|__PANEL__|$PANEL_PORT|g" \
+    "$OPT_NGX/nginx.conf"
+  if "$OPT_NGX/usr/sbin/nginx" -p "$OPT_NGX" -c "$OPT_NGX/nginx.conf" -t >/dev/null 2>&1; then
+    echo "  -> nginx config OK: :$ENTRY_PORT (entry) -> :$PANEL_PORT (panel), /rayws -> xray :28444"
+  else
+    echo "  !! nginx config test failed -- entry split disabled"
+    ENTRY_PORT="$PANEL_PORT"
+  fi
+}
+
 command -v apt-get >/dev/null || { echo "[ERR] apt-get is required"; exit 1; }
 command -v dpkg-deb >/dev/null || { echo "[ERR] dpkg-deb is required"; exit 1; }
 
@@ -186,7 +286,7 @@ for pidf in "$OPT_DSK"/logs/*.pid; do
   rm -f "$pidf"
 done
 pkill -f "$OPT_CF/bin/cloudflared" 2>/dev/null || true
-pkill -f "cloudflared.*127\.0\.0\.1:$PANEL_PORT" 2>/dev/null || true
+pkill -f "cloudflared.*127\.0\.0\.1:$ENTRY_PORT" 2>/dev/null || true
 
 # v3 makes supervisord the only supervisor, so it must go first: otherwise its children stay
 # alive holding mmap'd copies of $OPT_DSK/bin/* and step 4 dies with "Text file busy".
@@ -380,6 +480,9 @@ SEEDEOF
 # ------------------------------------------------------------------
 # Step 3: Online fetch .deb packages via apt-get --print-uris
 # ------------------------------------------------------------------
+echo "[2.5/7] nginx entry split (:${ENTRY_PORT} -> panel :${PANEL_PORT}, /rayws -> xray) ..."
+setup_nginx || { echo "  !! nginx setup threw -- entry split disabled"; ENTRY_PORT="$PANEL_PORT"; }
+
 echo "[3/7] Resolving & downloading .deb packages online..."
 APT_PKGS="xvfb x11-xkb-utils xkb-data x11vnc openbox tint2 patchelf xterm x11-utils novnc python3-websockify fonts-dejavu-core fonts-wqy-microhei wmctrl unzip librsvg2-2 librsvg2-common"
 # libasound2 vs libasound2t64：Ubuntu 24.04 起改名 t64，Debian 12 仍叫 libasound2
@@ -970,7 +1073,7 @@ if [ -n "$VNC_DOMAIN" ]; then
 fi
 if [ -n "$CF_API_TOKEN" ] && [ -n "$PANEL_DOMAIN" ]; then
   echo "  -> provisioning the tunnel through the Cloudflare API ($PANEL_DOMAIN)"
-  CF_OUT=$("$PY_BIN" - "$CF_API_TOKEN" "$PANEL_DOMAIN" "$PANEL_PORT" "$VNC_DOMAIN" "$NOVNC_PORT" <<'PYCF'
+  CF_OUT=$("$PY_BIN" - "$CF_API_TOKEN" "$PANEL_DOMAIN" "$ENTRY_PORT" "$VNC_DOMAIN" "$NOVNC_PORT" <<'PYCF'
 import json, os, sys, urllib.request, urllib.error
 
 token, domain, port = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -1152,14 +1255,31 @@ else
   {
     echo '; Cloudflare quick tunnel -> MintPanel. Managed by supervisord.'
     echo '; For a stable domain: create a tunnel in the Cloudflare dashboard, point its'
-    echo '; public hostname at http://127.0.0.1:'"$PANEL_PORT"' , then re-run this installer'
+    echo '; public hostname at http://127.0.0.1:'"$ENTRY_PORT"' , then re-run this installer'
     echo '; with CF_TUNNEL_TOKEN=<token>.'
     echo '[program:cloudflared]'
-    echo "command=$OPT_CF/bin/cloudflared --no-autoupdate tunnel --url http://127.0.0.1:$PANEL_PORT"
+    echo "command=$OPT_CF/bin/cloudflared --no-autoupdate tunnel --url http://127.0.0.1:$ENTRY_PORT"
     echo "stdout_logfile=$OPT_PANEL/cf-panel.log"
     cf_tail
   } > "$CF_PROG"
   CF_WAIT_LOG="$OPT_PANEL/cf-panel.log"
+fi
+
+# nginx 入口分流（supervisord 托管；挂掉则整站不可达，必须自动拉起）
+if [ -x "$OPT_NGX/usr/sbin/nginx" ]; then
+  cat > "$OPT_SV/etc/conf.d/nginx.conf" <<NGPROG
+[program:nginx]
+command=$OPT_NGX/usr/sbin/nginx -p $OPT_NGX -c $OPT_NGX/nginx.conf -g "daemon off;"
+priority=42
+autostart=true
+autorestart=true
+startsecs=2
+stopsignal=QUIT
+stopwaitsecs=10
+stdout_logfile=$OPT_NGX/sv.log
+redirect_stderr=true
+NGPROG
+  echo "  -> nginx program written (priority 42, before healthcheck)"
 fi
 
 "$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" reread 2>&1 | tail -2 || true
