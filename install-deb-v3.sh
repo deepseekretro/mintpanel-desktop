@@ -173,6 +173,32 @@ for pidf in "$OPT_DSK"/logs/*.pid; do
 done
 pkill -f "$OPT_CF/bin/cloudflared" 2>/dev/null || true
 pkill -f "cloudflared.*127\.0\.0\.1:$PANEL_PORT" 2>/dev/null || true
+
+# v3 makes supervisord the only supervisor, so it must go first: otherwise its children stay
+# alive holding mmap'd copies of $OPT_DSK/bin/* and step 4 dies with "Text file busy".
+if [ -x "$OPT_SV/bin/supervisorctl" ]; then
+  "$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" shutdown >/dev/null 2>&1 || true
+fi
+pkill -f "$OPT_SV/lib/bin/supervisord" 2>/dev/null || true
+pkill -f "$OPT_SV/bin/supervisord" 2>/dev/null || true
+pkill -f "$OPT_DSK/xvfb-run\.sh" 2>/dev/null || true
+pkill -f "$OPT_DSK/bin/websockify" 2>/dev/null || true
+pkill -f "$OPT_DSK/bin/x11vnc" 2>/dev/null || true
+pkill -f "$OPT_DSK/bin/tint2" 2>/dev/null || true
+pkill -f "$OPT_DSK/bin/openbox" 2>/dev/null || true
+pkill -f "$OPT_DSK/bin/Xvfb" 2>/dev/null || true
+pkill -x Xvfb 2>/dev/null || true
+pkill -x x11vnc 2>/dev/null || true
+pkill -x tint2 2>/dev/null || true
+pkill -x openbox 2>/dev/null || true
+# wait for the images to be unmapped before step 4 starts overwriting them
+for _i in $(seq 1 15); do
+  _alive=$(pgrep -f "$OPT_DSK/(bin|lib)/" 2>/dev/null | wc -l)
+  [ "$_alive" -eq 0 ] && break
+  sleep 1
+done
+pkill -9 -f "$OPT_DSK/(bin|lib)/" 2>/dev/null || true
+sleep 1
 if [ "$INSTALL_BROWSER" = "1" ]; then
   pkill -9 -f "camoufox/cf-ui\.mjs" 2>/dev/null || true
   pkill -9 -f "camoufox-bin" 2>/dev/null || true
@@ -405,7 +431,13 @@ done
 
 # Flatten binaries -> $OPT_DSK/bin
 for d in "$STAGE/root/usr/bin" "$STAGE/root/bin" "$STAGE/root/usr/sbin" "$STAGE/root/sbin"; do
-  [ -d "$d" ] && cp -a "$d"/. "$OPT_DSK/bin/"
+  if [ -d "$d" ]; then
+    cp -a "$d"/. "$OPT_DSK/bin/" 2>/dev/null || {
+      pkill -9 -f "$OPT_DSK/(bin|lib)/" 2>/dev/null || true
+      sleep 2
+      cp -a "$d"/. "$OPT_DSK/bin/"
+    }
+  fi
 done
 
 # Flatten shared libraries & plugin subdirs -> $OPT_DSK/lib
