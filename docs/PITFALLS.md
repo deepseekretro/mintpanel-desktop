@@ -495,3 +495,43 @@ SSR chunk `dist/server/pages/index.astro.mjs` 里的规则文案也随之改掉�
 验证（camoufox headless 实跑 `/services`）：
 `当前模式: 域名模式 (连接地址=de2.nodaroo.fun，SNI 跟随服务端伪装)` /
 `SNI: www.bing.com` / `SNI: www.microsoft.com` / SNI 输入框为空。
+
+## 23. xray 要出两条链路，hy2 只能一条
+
+UDP 走不了 cloudflared 隧道，所以两条协议的可达性完全不同：
+
+| 协议 | 直连 | 经 cloudflared |
+|---|---|---|
+| hysteria2 | ✅ `direct_host:SERVER_PORT` (UDP) | ❌ 隧道只转发 TCP/HTTP |
+| xray REALITY | ✅ `direct_host:SERVER_PORT` (TCP) | ❌ REALITY 是裸 TCP，隧道不透传 |
+| xray over WS | — | ✅ `面板域名:443` + `path=/rayws` |
+
+**不需要改云端隧道配置**：面板自己就在隧道后面，给它加一条 WebSocket upgrade 转发即可。
+
+1. xray vault 配置加一个 inbound（注意 ws 不能用 `flow: xtls-rprx-vision`）：
+
+```json
+{ "tag": "ws-in", "listen": "127.0.0.1", "port": 28443, "protocol": "vless",
+  "settings": { "clients": [{ "id": "<同 reality 的 uuid>", "email": "cdn@mint" }], "decryption": "none" },
+  "streamSettings": { "network": "ws", "wsSettings": { "path": "/rayws" } } }
+```
+
+2. 面板 `server.mjs` 的 `upgrade` 事件里加一条分支：`/rayws` → `127.0.0.1:28443`，**不校验 panel session**
+   （VLESS uuid 本身就是鉴权，客户端带不了浏览器 cookie）。
+
+3. `xraylib` 追加第二条 link，前端 `Me()` 按 `tag === "cdn"` 渲染成「Cloudflare 隧道」徽标。
+
+**前端必须放行 ws 链接**：`ae(link, host, sni)` 会把链接里的 `@host:` 和 `sni=` 改写成直连域名，
+隧道链接一改就废。加一条短路：
+
+```js
+if (/[?&]type=ws(&|#|$)/.test(a)) return a;
+```
+
+**验收**（客户端配置，不填 flow）：
+
+```
+vless://<uuid>@<panel-domain>:443?security=tls&type=ws&path=%2Frayws&host=<panel-domain>&sni=<panel-domain>&fp=chrome
+```
+
+实测两条链路出口 IP 都是 `94.130.237.57`（Hetzner DE）。
