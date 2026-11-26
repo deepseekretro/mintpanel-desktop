@@ -530,19 +530,11 @@ fi
 # ------------------------------------------------------------------
 echo "[5/7] Writing desktop configs & supervisord program set (supervisord is the only supervisor)..."
 
-# x11vnc needs a password: this build leaves 5900 reachable on the container ULA address
-# no matter what -no6/-rfbportv6/-allow say, and the desktop usually has a logged-in
-# browser. Reuse the existing file so a reinstall keeps the link working.
+# x11vnc listens on a unix socket only (-rfbport 0), so there is no TCP port to protect and
+# no password to type. websockify-go v1.1.0+ dials that socket; the panel proxies the rest.
 mkdir -p "$TARGET/.vnc"
-if [ -s "$TARGET/.vnc/passwd" ]; then
-  VNC_PW="(preserved - see $TARGET/.vnc/passwd)"
-else
-  VNC_PW=$("$PY_BIN" -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters+string.digits) for _ in range(8)))')
-  if ! LD_LIBRARY_PATH="$OPT_DSK/lib" "$OPT_DSK/bin/x11vnc" -storepasswd "$VNC_PW" "$TARGET/.vnc/passwd" >/dev/null 2>&1; then
-    printf '%s' "$VNC_PW" > "$TARGET/.vnc/passwd"
-  fi
-fi
-chmod 600 "$TARGET/.vnc/passwd" 2>/dev/null || true
+chmod 700 "$TARGET/.vnc"
+rm -f "$TARGET/.vnc/passwd"
 PY_BIN=""
 for cand in "$(command -v python3 2>/dev/null || true)" "$TARGET/python/bin/python3" "/usr/bin/python3"; do
   if [ -n "$cand" ] && [ -x "$cand" ]; then
@@ -760,8 +752,13 @@ if [ -n "$WS_FILE" ]; then
     # verify before wiring it into supervisord: a truncated/foreign-arch binary would
     # otherwise fail silently every restart
     if "$OPT_DSK/bin/websockify-go" -version >/dev/null 2>&1; then
-      WS_GO=1
-      echo "     websockify-go $("$OPT_DSK/bin/websockify-go" -version), $(stat -c%s "$OPT_DSK/bin/websockify-go") bytes"
+      WS_VER=$("$OPT_DSK/bin/websockify-go" -version)
+      case "$WS_VER" in
+        v1.1.*|v1.[2-9].*|v[2-9].*) WS_GO=1 ;;
+        *) echo "     !! websockify-go $WS_VER predates unix-socket targets; discarding"
+           rm -f "$OPT_DSK/bin/websockify-go" ;;
+      esac
+      [ "$WS_GO" -eq 1 ] && echo "     websockify-go $WS_VER, $(stat -c%s "$OPT_DSK/bin/websockify-go") bytes"
     else
       echo "     !! downloaded websockify-go does not run on this host, discarding it"
       rm -f "$OPT_DSK/bin/websockify-go"
@@ -771,13 +768,14 @@ fi
 
 if [ "$WS_GO" -eq 1 ]; then
   "$PY_BIN" - "$OPT_SV/etc/conf.d/desktop.conf" "$OPT_DSK" <<'PYWS'
-import sys
+import os, sys
 conf, dsk = sys.argv[1], sys.argv[2]
 out = []
 for line in open(conf, encoding='utf-8').read().splitlines():
     if line.startswith('command=') and 'websockify' in line:
         out.append(f"command={dsk}/bin/websockify-go -listen 127.0.0.1:__NOVNCPORT__ "
-                   f"-target 127.0.0.1:__VNCPORT__ -web {dsk}/share/novnc -stats /__stats")
+                   f"-target unix:{os.path.dirname(os.path.dirname(dsk))}/.vnc/vnc.sock "
+                   f"-web {dsk}/share/novnc -stats /__stats")
     elif line.startswith('environment=') and ('websockify' in line or 'PYTHONPATH' in line):
         continue  # the Go binary needs no PYTHONPATH
     else:
@@ -1274,8 +1272,8 @@ echo "   Browser    : $( [ "$INSTALL_BROWSER" = "1" ] && echo "installed ($TARGE
 echo "   Supervisor : $OPT_SV/bin/supervisord -c $OPT_SV/etc/supervisord.conf"
 "$OPT_SV/bin/supervisorctl" -c "$OPT_SV/etc/supervisord.conf" status 2>/dev/null | sed 's/^/                /' || true
 echo "   Desktop    : programs = xvfb / openbox / tint2 / x11vnc / websockify / healthcheck"
-echo "   Desktop URL: ${ENTRY_URL%/}/novnc/vnc.html?password=${VNC_PW}&autoconnect=true"
-echo "   VNC passwd : ${VNC_PW}  (~/.vnc/passwd)"
+echo "   Desktop URL: ${ENTRY_URL%/}/novnc/vnc.html  (no password: x11vnc is on a unix socket)"
+echo "   VNC socket : $TARGET/.vnc/vnc.sock (no TCP listener)"
 echo "   Wallpaper  : $OPT_DSK/share/wallpaper/debian13-ceratopsian.svg (set once by xvfb-run.sh)"
 echo "   Entry point: openbox right-click menu / F1 -> camoufox/open-two.sh (no desktop icon)"
 echo "   .bashrc    : no autostart hook (supervisord owns liveness)"

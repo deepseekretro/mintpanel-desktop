@@ -79,7 +79,7 @@ func main() {
 
 	var p proxy
 	flag.StringVar(&p.listen, "listen", "127.0.0.1:6080", "listen address")
-	flag.StringVar(&p.target, "target", "127.0.0.1:5900", "TCP target (VNC server)")
+	flag.StringVar(&p.target, "target", "127.0.0.1:5900", "target VNC server: host:port or unix:/path")
 	flag.StringVar(&p.webDir, "web", "", "serve this directory as static files (noVNC)")
 	flag.StringVar(&p.wsPath, "ws-path", "/websockify", `upgrade only this path ("" = any path)`)
 	flag.StringVar(&p.statsPath, "stats", "", "optional JSON stats endpoint, e.g. /__stats")
@@ -223,7 +223,14 @@ func (p *proxy) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer s.close()
 
 	d := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	tcp, err := d.DialContext(r.Context(), "tcp", p.target)
+	// "unix:/path" dials an AF_UNIX socket instead of TCP. x11vnc can then run with
+	// -rfbport 0 -unixsock, so no TCP listener exists at all (its IPv6 socket cannot be
+	// disabled in some builds) and no VNC password is needed.
+	network, addr := "tcp", p.target
+	if strings.HasPrefix(p.target, "unix:") {
+		network, addr = "unix", strings.TrimPrefix(p.target, "unix:")
+	}
+	tcp, err := d.DialContext(r.Context(), network, addr)
 	if err != nil {
 		log.Printf("conn#%d dial %s failed: %v", s.id, p.target, err)
 		_ = ws.WriteControl(websocket.CloseMessage,
