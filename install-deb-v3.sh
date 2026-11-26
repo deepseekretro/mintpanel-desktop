@@ -70,6 +70,7 @@ mintpanel-desktop installer
 其他变量：
   MINTPANEL_PORT=8090   MINTPANEL_DIR=$HOME   VNC_PORT=5900   NOVNC_PORT=6080
   DISPLAY_NUM=99        BASE_URL=<release>    TOKEN=<private mirror token>
+  PANEL_DIRECT_HOST=de2.example.fun   real host for hy2/xray node links
   CF_ACCOUNT_ID / CF_ZONE_ID / CF_TUNNEL_NAME  可选，省掉两次查询 / 自定义隧道名
   MINTPANEL_TOKEN=<hex> 面板访问口令；不给则沿用上一次安装的，只有全新机器才随机生成
 USAGE
@@ -249,6 +250,22 @@ echo "[2/7] Downloading & installing MintPanel -> $OPT_PANEL ..."
   dl "$(rel_url mintpanel-bundle-x86_64.tar.gz)" "$STAGE/panel.tar.gz"
   tar -xzf "$STAGE/panel.tar.gz" -C "$OPT_PANEL"
   rm -f "$STAGE/panel.tar.gz"
+
+# The real host name this machine is reachable on, used for hy2/xray node links.
+# A Cloudflare tunnel only proxies HTTP/WebSocket, so a link generated from the tunnel
+# hostname (nodaroo-02.10w123.com) can never carry hy2 UDP or xray REALITY TCP. The panel
+# reads this file and exposes it to the UI as the panel_direct_host cookie, which wins
+# over location.hostname. PANEL_DIRECT_HOST may hold several candidates, one per line;
+# the panel then keeps the one whose A record matches the outbound IP.
+if [ -n "${PANEL_DIRECT_HOST:-}" ]; then
+  printf '%s\n' "$PANEL_DIRECT_HOST" | tr ',' '\n' | sed '/^\s*$/d' > "$OPT_PANEL/.direct_host"
+  echo "     direct host for node links: $(tr '\n' ' ' < "$OPT_PANEL/.direct_host")"
+elif [ -s "$OPT_PANEL/.direct_host" ]; then
+  echo "     direct host kept from the previous install: $(tr '\n' ' ' < "$OPT_PANEL/.direct_host")"
+else
+  echo "     !! PANEL_DIRECT_HOST unset: hy2/xray node links will use the tunnel hostname"
+  echo "        and will not connect. Re-run with PANEL_DIRECT_HOST=<your.direct.domain>"
+fi
 
 cat > "$OPT_PANEL/start.sh" <<EOF
 #!/usr/bin/env bash

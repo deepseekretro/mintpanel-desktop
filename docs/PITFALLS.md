@@ -453,3 +453,14 @@ curl -s -i --http1.1 -H "Cookie: mintpanel_session=$SESS" \
 | 修法 1 | `ipcs -m \| awk -v me=$(id -u) '$1 ~ /^0x/ && $3 == me && $6 == 0 {print $2}' \| while read id; do ipcrm -m $id; done`（`ipcrm -m` 一次只能删一个，`xargs -n 200 ipcrm -m` 是错的） |
 | 修法 2（根治） | x11vnc 加 **`-noshm`**，不再用 SysV 共享内存；安装脚本也会在启动前清理孤儿段 |
 | 注意 | `/dev/shm` 用量为 0 与 SysV shm 无关，别被 `df /dev/shm` 误导 |
+
+## 21. hy2 / xray 节点链接不能用手访问面板的域名（隧道域名）
+
+| 项 | 内容 |
+|---|---|
+| 症状 | 通过 `nodaroo-02.10w123.com` 打开面板，复制出来的 hy2/xray 节点串连不上 |
+| 根因 | cloudflared 只代理 HTTP/WebSocket。hy2 是 UDP、xray REALITY 是裸 TCP，**都不过隧道**。而 UI 的 `q()` 默认取 `location.hostname`，于是把隧道域名写进了节点地址 |
+| 修法 | 面板探测「直连域名」并以 cookie `panel_direct_host` 下发给浏览器；UI 的 `q()` 优先读这个 cookie，再回落到 `location.hostname` |
+| 配置 | `PANEL_DIRECT_HOST=de2.nodaroo.fun`（安装脚本写入 `<panel>/.direct_host`，一行一个候选；多个候选时按 A 记录与出口 IP 匹配取正确的那个） |
+| 服务端细节 | cookie 必须在 `res.writeHead(status, headers)` 的 headers 里合并，不能用 `res.setHeader` —— Astro 传自己的 headers 对象会把先前设置整个覆盖 |
+| 检查 | `curl -D- -X POST .../api/auth/login` 应同时出现 `mintpanel_session` 和 `panel_direct_host=...` |
