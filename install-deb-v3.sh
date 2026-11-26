@@ -121,10 +121,16 @@ OPT_CF="$OPT_DIR/cloudflared"
 
 INSTALL_BROWSER="${INSTALL_BROWSER:-}"
 if [ -z "$INSTALL_BROWSER" ]; then
-  if [ -r /dev/tty ]; then
-    printf "是否安装 Camoufox 浏览器及默认扩展 (uBlock Origin + Cookie-Editor)? [Y/n]: " >/dev/tty
-    read -r INSTALL_BROWSER </dev/tty || INSTALL_BROWSER="y"
+  # `curl | bash` still owns a controlling terminal, setsid/nohup does not. Opening
+  # /dev/tty is the only reliable probe: `[ -r /dev/tty ]` is true even without a
+  # controlling terminal, and the printf then fails and kills the script under `set -e`.
+  if { exec 3<>/dev/tty; } 2>/dev/null; then
+    printf "是否安装 Camoufox 浏览器及默认扩展 (uBlock Origin + Cookie-Editor)? [Y/n]: " >&3
+    read -r INSTALL_BROWSER <&3 || INSTALL_BROWSER="y"
+    exec 3>&-
   else
+    echo "[i] 没有可用的终端（setsid/nohup/CI），默认安装 Camoufox 及扩展"
+    echo "    要跳过浏览器请设 INSTALL_BROWSER=n 后重新运行"
     INSTALL_BROWSER="y"
   fi
 fi
