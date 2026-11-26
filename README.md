@@ -10,7 +10,7 @@
 
 ```bash
 # 全新容器，一条命令
-curl -fsSL https://raw.githubusercontent.com/deepseekretro/mintpanel-desktop/main/install-deb-v3.sh | bash
+curl -fsSL https://raw.githubusercontent.com/deepseekretro/mintpanel-desktop/HEAD/install-deb-v3.sh | bash
 ```
 
 装完会打印 supervisord 的 program 状态和面板地址。可选环境变量：
@@ -24,6 +24,9 @@ curl -fsSL https://raw.githubusercontent.com/deepseekretro/mintpanel-desktop/mai
 | `INSTALL_BROWSER` | 1 | 是否装 Camoufox（0 = 跳过） |
 | `BASE_URL` | 本仓库 `dist/` | 私有镜像时指向自己的 release 目录 |
 | `TOKEN` | 空 | 仅当 `BASE_URL` 需要鉴权时才设置 |
+
+`websockify-go` 提供 `linux/amd64` 和 `linux/arm64` 预编译二进制（`dist/websockify-go-linux-*`），
+安装时按 `uname -m` 自动选择；拉不到时才退回源码编译，最后才是 Python websockify。
 
 从私有镜像安装：
 

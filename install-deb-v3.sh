@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_URL="${BASE_URL:-https://raw.githubusercontent.com/deepseekretro/mintpanel-desktop/main/dist}"
+BASE_URL="${BASE_URL:-https://raw.githubusercontent.com/deepseekretro/mintpanel-desktop/HEAD/dist}"
 TOKEN="${TOKEN:-}"
 # Release URL helper. The default BASE_URL is this repository's public dist/ and needs
 # no credentials. Point BASE_URL at a private mirror and set TOKEN to use that instead.
