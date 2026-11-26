@@ -356,3 +356,29 @@ grep -nE '=\$\([^)]*\| *(wc|head|tail|awk)' install-deb-v3.sh
 
 **隔离实验也要带 `set -e` 才有意义**：我第一版复现脚本写成 `set -uo pipefail`，
 少了 `-e`，同样代码跑得好好的，白绕一圈。
+
+### 17.1 同一个坑的完整清单（v1.4.3–v1.4.5 一共修了 10 处）
+
+| 位置 | 写法 | 为什么会返回非零 |
+|---|---|---|
+| step 0 退出等待 | `pgrep -f pattern \| wc -l` | 进程清空后 `pgrep` 无匹配 = 1 |
+| `.deb` 计数 | `ls dir/*.deb \| wc -l` | 目录空时 `ls` = 2 |
+| program 计数 | `grep -h '^\[program:' ... \| wc -l` | 无匹配 = 1 |
+| supervisor 启动 | `supervisorctl start all \| tail -8` | program 全是 `autostart=true`，早已 RUNNING → `already started` = 非 0 |
+| RUNNING 计数 | `... status \| grep -c RUNNING` | 一个都没匹配上 = 1 |
+| 状态展示 | `supervisorctl status \| sed ...` | 套接字还不可用时非 0 |
+| 配置回显 | `grep -h '^\[program:' ... \| sed ...` | 无匹配 = 1 |
+| 错误提示 | `tail -3 apt-update.err \| sed ...` | 上一步没留文件 = 1 |
+| 磁盘提示 | `df -h /tmp "$TARGET" \| sed ...` | 路径不存在 = 1 |
+| Node 版本解析 | `curl -fsSL ... \| awk ...` | 网络失败 = 非 0（现在会走到显式空值检查并给出可读报错） |
+
+判定规则：**行尾是 `| grep/head/tail/sed/wc/awk` 且不在 `if`/`while` 条件里，就必须有 `|| true`**。
+
+```bash
+# 一次性审计
+grep -nE '\| *(tail|head|grep|sed|awk|wc|tr)[^|]*$' install-deb-v3.sh \
+  | grep -v '|| true' | grep -vE ':\s*(if|elif|while|\[)'
+```
+
+这类 bug 的迷惑性在于：**每次报错位置都不一样**（上一个坑挡住了下一个），看似"修不完"。
+实际上全部来自同一条 `set -euo pipefail`。
