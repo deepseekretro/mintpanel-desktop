@@ -464,3 +464,17 @@ curl -s -i --http1.1 -H "Cookie: mintpanel_session=$SESS" \
 | 配置 | `PANEL_DIRECT_HOST=de2.nodaroo.fun`（安装脚本写入 `<panel>/.direct_host`，一行一个候选；多个候选时按 A 记录与出口 IP 匹配取正确的那个） |
 | 服务端细节 | cookie 必须在 `res.writeHead(status, headers)` 的 headers 里合并，不能用 `res.setHeader` —— Astro 传自己的 headers 对象会把先前设置整个覆盖 |
 | 检查 | `curl -D- -X POST .../api/auth/login` 应同时出现 `mintpanel_session` 和 `panel_direct_host=...` |
+
+### 补充：域名模式下前端也不能把域名当 SNI
+
+后端把 `sni` 固定成服务端 `serverNames`（`www.microsoft.com` / hy2 的 `www.bing.com`）后，
+前端还有两处会把它改回去：
+
+| 位置 | 原行为 | 改成 |
+|---|---|---|
+| `K(host)` 自动模式 | host 是域名 → 返回 host 当 SNI | 返回 `""`，不覆盖后端给的 sni |
+| `ae(link, host, sni)` | `!sni && host` 时用 host 补 sni | 去掉这个回退 |
+| 状态文案 | `SNI 已自动跟随=<域名>` | `连接地址=<域名>，SNI 跟随服务端伪装` |
+| SNI 输入框 | 自动模式把域名填进去 | 保持空 |
+
+实测：`vless://...@de2.nodaroo.fun:25675?...&sni=www.microsoft.com`（自动模式），手动填 SNI 仍生效。
