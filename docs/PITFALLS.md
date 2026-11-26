@@ -478,3 +478,20 @@ curl -s -i --http1.1 -H "Cookie: mintpanel_session=$SESS" \
 | SNI 输入框 | 自动模式把域名填进去 | 保持空 |
 
 实测：`vless://...@de2.nodaroo.fun:25675?...&sni=www.microsoft.com`（自动模式），手动填 SNI 仍生效。
+
+#### 第二层：卡片徽标 + 输入框 + 初始状态行
+
+上一条只修了 `K()`，页面仍有三处把域名当成 SNI：
+
+| 位置 | 原代码 | 现象 |
+|---|---|---|
+| `je()` / `Me()` 卡片徽标 | `r=a||(H(n)?o.sni:n)` | 卡片显示 `SNI: de2.nodaroo.fun`（复制出来的链接却是 `www.bing.com`） |
+| `je()` / `Me()` 预填 | `t("node-custom-sni").value=H(n)?"":n` | SNI 输入框被填成域名 |
+| 初始化 | 只有事件处理器里调 `oe()` | `node-host-status` 一直停在 SSR 占位文案 `当前模式: IP 原生` |
+
+改法：徽标用 `r=a||o.sni`；输入框恒置空；初始化链末尾补一次 `oe()`（`De(),oe(),setInterval(...)`）。
+SSR chunk `dist/server/pages/index.astro.mjs` 里的规则文案也随之改掉——原来写的是「域名模式下 SNI 自动跟随域名」，与现在的行为相反。
+
+验证（camoufox headless 实跑 `/services`）：
+`当前模式: 域名模式 (连接地址=de2.nodaroo.fun，SNI 跟随服务端伪装)` /
+`SNI: www.bing.com` / `SNI: www.microsoft.com` / SNI 输入框为空。
